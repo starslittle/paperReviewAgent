@@ -14,23 +14,29 @@ Recent advances in large language models (LLMs) have demonstrated significant pr
 ### Requirements
 
 ```Shell
-pip install pdfservices-sdk openpyxl pandas PyMuPDF openai pillow
+pip install pdfservices-sdk openpyxl pandas PyMuPDF openai pillow python-dotenv
+```
+
+### Configuration
+Create a `.env` file in the root directory and add your API keys:
+```env
+ADOBE_CLIENT_ID=your_adobe_client_id
+ADOBE_CLIENT_SECRET=your_adobe_client_secret
+DEEPSEEK_API_KEY=your_deepseek_api_key
 ```
 
 ### Data Pre-Processing
 Prerequisite: Obtain free Adobe PDF Service Client ID and Secret from [here](https://acrobatservices.adobe.com/dc-integration-creation-app-cdn/main.html?api=pdf-services-api).
 ```bash
 cd preprocess
-python 1_run_pdf_extract.py --client-id <your_client_id> --client-secret <your_client_secret> \
-              --raw-data-dir ../sample_data/ --result-dir ./extract_output/
+python 1_run_pdf_extract.py --raw-data-dir ../sample_data/ --result-dir ./extract_output/
 python 2_process_extracted_data.py --extract-data-dir ./extract_output/ --save-dir ./processed_output/
 python 3_make_page_images.py --raw-data-dir ../sample_data/ --save-dir ./processed_output/
 ```
 
 ### Run DocAgent
 ```bash
-python ./run_experiment.py --api-key <your_openai_api_key> \
-                           --preprocessed-data-dir ./preprocess/processed_output/ \
+python ./run_experiment.py --preprocessed-data-dir ./preprocess/processed_output/ \
                            --save-dir ./sample_results/
 ```
 

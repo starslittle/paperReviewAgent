@@ -11,6 +11,9 @@ import glob
 import logging
 import os
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()  # Load variables from .env file
 
 from adobe.pdfservices.operation.auth.service_principal_credentials import (
     ServicePrincipalCredentials,
@@ -51,12 +54,12 @@ def parse_arguments():
     #                     help="PDF Services Client ID")
     parser.add_argument(
         "--client-id",
-        default="a7958496554a40489a43aa23226e0f80",
+        default=os.getenv("ADOBE_CLIENT_ID"),
         help="PDF Services Client ID",
     )
     parser.add_argument(
         "--client-secret",
-        default="p8e-nQXgvazaRFCEfQmdY96je61Lze3ignoA",
+        default=os.getenv("ADOBE_CLIENT_SECRET"),
         help="PDF Services Client Secret",
     )
     parser.add_argument(

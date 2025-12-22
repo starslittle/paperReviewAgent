@@ -1,6 +1,9 @@
 import argparse
 import json
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import doc_agent
 import doc_reader
@@ -9,13 +12,13 @@ parser = argparse.ArgumentParser(description="Run experiment")
 parser.add_argument(
     "--api-key",
     type=str,
-    default=os.getenv("DEEPSEEK_API_KEY", "sk-e93bee09615e4fc9bcaaa9b770c77ebd"),
+    default=os.getenv("DEEPSEEK_API_KEY"),
     help="API key (or set DEEPSEEK_API_KEY env var)",
 )
 parser.add_argument(
     "--base-url",
     type=str,
-    default="https://api.deepseek.com",
+    default=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
     help="Base URL for the API",
 )
 parser.add_argument(
