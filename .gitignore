@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Project Specific - Data & Outputs
+# Ignore all extracted and processed data
+preprocess/extract_output/
+preprocess/processed_output/
+sample_results/
+
+# Binary and Large Files
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.xlsx
+*.zip
+*.pkl
+*.json
+
+# Exceptions (Files we want to keep despite the above rules)
+!prompts.py
+!README.md
+!LICENSE
+!sample_data/**
+!sample_results/job_00000.json
+!sample_results/job_000001.json
+
