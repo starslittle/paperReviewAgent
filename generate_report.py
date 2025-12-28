@@ -44,8 +44,18 @@ def generate_html(json_path, output_path):
             .badge.Low {{ background: #3498db; }}
             .quote {{ background: #fff3cd; padding: 10px; border-left: 4px solid #ffc107; margin: 10px 0; font-style: italic; }}
             .suggestion {{ background: #d4edda; padding: 10px; border-left: 4px solid #28a745; margin: 10px 0; }}
+            .thinking-box {{ background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px; margin-top: 20px; }}
+            .thinking-header {{ padding: 10px 15px; background: #e9ecef; cursor: pointer; font-weight: bold; display: flex; justify-content: space-between; align-items: center; }}
+            .thinking-content {{ padding: 15px; display: none; background: #fff; color: #333; font-family: 'Segoe UI', sans-serif; line-height: 1.6; }}
+            .thinking-content h1, .thinking-content h2, .thinking-content h3 {{ margin-top: 1em; margin-bottom: 0.5em; color: #2c3e50; }}
+            .thinking-content p {{ margin-bottom: 1em; }}
+            .thinking-content ul, .thinking-content ol {{ margin-left: 20px; margin-bottom: 1em; }}
+            .thinking-content code {{ background: #f1f3f5; padding: 2px 4px; border-radius: 3px; font-family: Consolas, monospace; color: #c7254e; }}
+            .thinking-content pre {{ background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto; border: 1px solid #ddd; }}
+            .thinking-content pre code {{ background: none; color: inherit; padding: 0; }}
             .meta {{ font-size: 0.9em; color: #7f8c8d; margin-bottom: 5px; }}
         </style>
+        <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <script>
             function toggle(id) {{
                 var x = document.getElementById(id);
@@ -55,6 +65,17 @@ def generate_html(json_path, output_path):
                     x.style.display = "none";
                 }}
             }}
+            document.addEventListener("DOMContentLoaded", function() {{
+                var markdownDivs = document.querySelectorAll(".markdown-content");
+                markdownDivs.forEach(function(div) {{
+                    var rawContent = div.textContent.trim();
+                    // Fix: Add newlines before each [Image X] thinking block to ensure they render as separate paragraphs/headers
+                    // This regex looks for [Image and adds two newlines before it
+                    // Also make "Image X" bold using markdown syntax
+                    var processedContent = rawContent.replace(/(\\[Image\\s+.*?\\]:)/g, '\\n\\n**$1**\\n');
+                    div.innerHTML = marked.parse(processedContent);
+                }});
+            }});
         </script>
     </head>
     <body>
@@ -78,6 +99,36 @@ def generate_html(json_path, output_path):
                 <div class="card bg-green">
                     <div class="score">{len(issues)}</div>
                     <div>问题总数</div>
+                </div>
+            </div>
+
+            <div class="thinking-box">
+                <div class="thinking-header" onclick="toggle('thinking_norm')">
+                    <span>🧠 AI 思考过程：规范性审查 (Normative Review)</span>
+                    <span>▼</span>
+                </div>
+                <div id="thinking_norm" class="thinking-content markdown-content">
+                    {data.get('normative_thinking', '无思考过程')}
+                </div>
+            </div>
+
+            <div class="thinking-box">
+                <div class="thinking-header" onclick="toggle('thinking_logic')">
+                    <span>🧠 AI 思考过程：逻辑审查 (Logic Review)</span>
+                    <span>▼</span>
+                </div>
+                <div id="thinking_logic" class="thinking-content markdown-content">
+                    {data.get('logic_thinking', '无思考过程')}
+                </div>
+            </div>
+
+            <div class="thinking-box" style="margin-bottom: 30px;">
+                <div class="thinking-header" onclick="toggle('thinking_vision')">
+                    <span>🧠 AI 思考过程：视觉审查 (Vision Review)</span>
+                    <span>▼</span>
+                </div>
+                <div id="thinking_vision" class="thinking-content markdown-content">
+                    {data.get('vision_thinking', '无思考过程')}
                 </div>
             </div>
 

@@ -99,7 +99,7 @@ class DocAgent:
 
     def run_vision_review(
         self,
-        vision_model_id="qwen-vl-max",
+        vision_model_id="qwen3-vl-flash",
         max_images=50,
         vision_api_key=None,
         vision_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -121,15 +121,21 @@ class DocAgent:
     - 如果图片内容和正文/标题不冲突、不矛盾，则视为“无问题”。
     - 忽略所有与“图文一致性”无关的视觉瑕疵（如清晰度、美观度、水印、边框等）。
 
-    请严格按以下维度检查：
-    1. 图文一致性（唯一核心）：
-       - 图片下方的标题（Caption）是否准确描述了图片内容？
-       - 正文提到的关键数据/趋势（如“如图3所示，准确率达到95%”），在图中是否真的体现了？如果图中显示只有80%，请报错。
-       - 图片中的关键文字/符号是否与正文描述矛盾？
-    
-    2. 规范性（仅限严重错误）：
-       - 仅当缺失关键的坐标轴含义、单位、图例导致图片完全无法理解时，才报错。
-       - 编号错误（如图3在文中写成图4）。
+    【工作模式】
+    我会提供以下输入：
+    1. 【目标图片】（裁剪图）：需要审查的核心对象。
+    2. 【相关页面截图】（多张）：包含该图片的当前页、上一页和下一页。
+    3. 【文本上下文】：从文档流中提取的参考文本（可能存在图号混乱，仅供参考）。
+
+    请严格按以下步骤操作（Visual Grounding）：
+    1. **视觉定位**：在【相关页面截图】中，肉眼寻找【目标图片】的确切位置。
+    2. **提取真标题**：
+       - 读取紧贴该图片下方（或上方）的黑体/小字文本，提取出真正的“图题（Caption）”（例如 "图 2-5 ..."）。
+       - **警告**：文档流提供的文本可能包含错误的图号（例如混入了下一张图的标题）。
+       - **规则**：如果文档流文本中的图号（如"图2-6"）与你在图片附近看到的图号（如"图2-5"）不一致，**绝对以你在图中看到的为准**。
+    3. **一致性检查**：
+       - 判断【目标图片】的内容是否符合【真标题】的描述。
+       - 判断【目标图片】的内容是否支持正文中关于该图号的关键声称。
 
     【严厉禁止】
     - 禁止评论图片清晰度、分辨率、字号大小。
@@ -138,7 +144,10 @@ class DocAgent:
     - 如果图片与论文学术内容无关（如装饰/Logo/广告/二维码），直接忽略，issues返回空。
 
     输出格式要求：
-    1. 首先在 <thinking> 标签中进行思考分析。
+    1. 首先在 <thinking> 标签中进行思考分析：
+       - 我在页面截图中看到了目标图片吗？
+       - 图片旁边实际的 Caption 是什么？（对比文档流提供的 Caption 是否一致）
+       - 图片内容是什么？与 Caption 和正文矛盾吗？
     2. 然后输出一个 JSON 对象，包含 "issues" 列表。每个 issue 包含 "severity" (High/Medium/Low), "issue_type", "suggestion"。
     3. 如果图片没有明显逻辑矛盾，"issues" 列表为空。
     4. **请务必使用中文进行回复。**
@@ -242,25 +251,39 @@ class DocAgent:
             )
 
             # Optionally attach the full page image to help the model see captions/footers
+            # New Strategy: Attach Previous Page, Current Page, Next Page to handle cross-page captions
             page_image_block = []
             if include_page_image and str(meta["page_num"]).isdigit():
-                try:
-                    page_media_type, page_base64_img, page_err = (
-                        self.doc_reader.get_page_image(int(float(meta["page_num"])))
-                    )
-                    if not page_err:
-                        page_image_block.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{page_media_type};base64,{page_base64_img}"
-                                },
-                            }
+                current_page = int(float(meta["page_num"]))
+                # Fetch Previous, Current, Next pages
+                pages_to_fetch = [current_page - 1, current_page, current_page + 1]
+
+                for p_num in pages_to_fetch:
+                    if p_num < 1 or p_num > self.doc_reader.num_page:
+                        continue
+                    try:
+                        page_media_type, page_base64_img, page_err = (
+                            self.doc_reader.get_page_image(p_num)
                         )
-                except Exception as e:
-                    print(
-                        f"[Agent] [Vision] Failed to attach page image for page {meta['page_num']}: {e}"
-                    )
+                        if not page_err:
+                            page_image_block.append(
+                                {
+                                    "type": "text",
+                                    "text": f"【页面截图 Page {p_num}】(请在此页面寻找目标图片及标题):",
+                                }
+                            )
+                            page_image_block.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{page_media_type};base64,{page_base64_img}"
+                                    },
+                                }
+                            )
+                    except Exception as e:
+                        print(
+                            f"[Agent] [Vision] Failed to attach page image for page {p_num}: {e}"
+                        )
 
             # Construct message for Vision Model
             messages = [

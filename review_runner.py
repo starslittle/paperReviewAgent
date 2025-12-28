@@ -52,7 +52,7 @@ def parse_args():
     parser.add_argument(
         "--vision-model",
         type=str,
-        default="qwen-vl-max",
+        default="qwen3-vl-flash",
         help="Model ID for vision review",
     )
     parser.add_argument(
@@ -107,6 +107,7 @@ def main():
                 vision_model_id=args.vision_model,
                 vision_api_key=args.vision_api_key,
                 vision_base_url=args.vision_base_url,
+                include_page_image=True,
             )
 
             norm_res = future_norm.result()
