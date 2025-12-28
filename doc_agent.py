@@ -16,6 +16,7 @@ from prompts import (
     reflection_prompt_template,
     reviewer_prompt,
     system_prompt,
+    vision_verify_prompt,
 )
 
 
@@ -87,10 +88,162 @@ class DocAgent:
             print(traceback.format_exc())
             return {"raw": "", "thinking": "", "error": str(e)}
 
+    def _parse_json(self, raw_content):
+        """Helper to safely extract and parse JSON from LLM response."""
+        try:
+            start = raw_content.find("{")
+            end = raw_content.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw_content[start : end + 1])
+            return json.loads(raw_content)
+        except Exception:
+            return {}
+
+    def _needs_vision_verification(self, issue):
+        """Determine if an issue needs vision verification (e.g. missing sections, page numbers)."""
+        suggestion = issue.get("suggestion", "")
+        issue_type = issue.get("issue_type", "")
+        # Keywords that suggest a parser failure might be the cause
+        keywords = ["编号", "缺少", "丢失", "不连续", "页码", "不一致", "章节"]
+
+        if issue_type == "Format" and any(k in suggestion for k in keywords):
+            return True
+        return False
+
+    def verify_with_vision(self, issue):
+        """
+        Verify a normative issue using Vision Model.
+        Returns (is_false_positive, reason_str).
+        """
+        page = issue.get("page")
+        if not page or not str(page).isdigit():
+            return False, "无法验证：缺少有效页码"
+
+        page_num = int(float(page))
+        suggestion = issue.get("suggestion", "")
+
+        print(
+            f"[Verification] Checking page {page_num} for issue: {suggestion[:30]}..."
+        )
+
+        try:
+            media_type, base64_img, error = self.doc_reader.get_page_image(page_num)
+            if error:
+                return False, f"无法加载图片: {error}"
+
+            prompt = vision_verify_prompt.format(issue_description=suggestion)
+
+            # Determine client (reuse logic from run_vision_review or simplify)
+            # Assuming Qwen/Dashscope for vision
+            client = self.client
+            model_id = "qwen3-vl-flash"  # Default for verification
+
+            # Use same vision config if possible, but here we simplify for demonstration
+            # In production, pass vision config to __init__ or run_normative_review
+            if "deepseek" in self.model_id:
+                # DeepSeek can't do vision, need DashScope client if not initialized
+                # For now, we skip verification if main client is text-only and no vision client setup
+                # NOTE: This assumes self.client is capable if model_id is qwen, or we need a new client.
+                # To keep it simple, we assume the user has set up environment for Qwen.
+                pass
+
+            # Construct message
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{base64_img}"
+                            },
+                        },
+                    ],
+                }
+            ]
+
+            # We need a vision-capable client.
+            # If self.client is DeepSeek, we need a separate client.
+            # For simplicity in this edit, let's try to use the same client logic as run_vision_review
+            # BUT we don't have the api key passed into this method.
+            # We will fallback to os.environ or skip.
+
+            import os
+
+            vision_api_key = os.getenv("DASHSCOPE_API_KEY")
+            if not vision_api_key:
+                print("[Verification] Skipped: DASHSCOPE_API_KEY not found.")
+                return False, "缺少 Vision API Key"
+
+            from openai import OpenAI
+
+            vision_client = OpenAI(
+                api_key=vision_api_key,
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            )
+
+            response = vision_client.chat.completions.create(
+                model="qwen3-vl-flash",
+                messages=messages,
+                max_tokens=500,
+                temperature=0.1,
+            )
+
+            res_json = self._parse_json(response.choices[0].message.content)
+            is_false_positive = res_json.get("is_false_positive", False)
+            reason = res_json.get("reason", "无理由")
+
+            if is_false_positive:
+                print(f"[Verification] False positive detected! Reason: {reason}")
+
+            return is_false_positive, reason
+
+        except Exception as e:
+            print(f"[Verification] Failed: {e}")
+            return False, str(e)
+
     def run_normative_review(self):
         """规范性审查（Format），不使用工具，返回包含 raw 和 thinking 的字典。"""
-        print("[Agent] Starting Normative Review...")
-        return self._run_simple_review(normative_prompt)
+        print("[Agent] Starting Normative Review (Text Analysis)...")
+        res = self._run_simple_review(normative_prompt)
+
+        # Parse initial issues
+        data = self._parse_json(res["raw"])
+        initial_issues = data.get("issues", [])
+        verified_issues = []
+
+        print(f"[Agent] Initial Normative Issues: {len(initial_issues)}")
+
+        verification_log = "\n\n### 👁️ 视觉验证环节 (Visual Verification)\n"
+        verification_log += "针对潜在的 PDF 解析误差（如章节丢失、页码错误），Agent 调用了视觉模型对原始页面进行了二次核查：\n\n"
+        has_verification = False
+
+        for issue in initial_issues:
+            if self._needs_vision_verification(issue):
+                has_verification = True
+                is_fp, reason = self.verify_with_vision(issue)
+                if not is_fp:
+                    verified_issues.append(issue)
+                    verification_log += f"- ✅ **保留 Issue**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 问题属实或无法排除。({reason})\n"
+                else:
+                    verification_log += f"- ❌ **移除误报 (False Positive)**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 页面截图显示该内容实际存在，系解析器遗漏。({reason})\n"
+            else:
+                verified_issues.append(issue)
+
+        if has_verification:
+            # Append log to thinking
+            current_thinking = res.get("thinking", "")
+            if not current_thinking:
+                current_thinking = "（无初始思考过程）"
+            res["thinking"] = current_thinking + verification_log
+
+        # Update JSON in raw response (hacky but keeps compatibility)
+        data["issues"] = verified_issues
+        res["raw"] = json.dumps(data, ensure_ascii=False, indent=2)  # Update raw json
+
+        print(f"[Agent] Verified Normative Issues: {len(verified_issues)}")
+        return res
 
     def run_logic_review(self):
         """逻辑审查（Logic），不使用工具，返回包含 raw 和 thinking 的字典。"""

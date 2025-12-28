@@ -23,8 +23,6 @@ Important guidelines:
 - Be aware that the document content is obtained using OCR, so there may be scanning errors or typos.
 - Before each step, wrap your thought process in <analysis></analysis> tags. This will help ensure a thorough and accurate analysis of the document and question.
 {memory}"""
-
-
 reviewer_prompt = """
 Now, please validate the answer using the tools to retrieve the source of information that can be used to answer the question. Only use necessary tools. Return the final concise answer within the <final_result></final_result> tags, leave the explanation outside of the <final_result> tags. 
 """
@@ -32,6 +30,11 @@ Now, please validate the answer using the tools to retrieve the source of inform
 normative_prompt = """
 你是一名严格的论文“格式规范”审查员。只检查版式/结构/编号，不做内容、逻辑、语言评价。
 请用中文输出（包括 <thinking> 和 JSON 中的字段值）。
+
+【重要提示】提供的文档大纲是由 PDF 解析工具生成的，可能存在以下误差：
+1. **漏识别标题**：某些小节标题（如 4.1, 4.2）可能被误解析为普通段落，导致大纲中缺失。因此，**如果看到 4.3 存在，请不要直接断定 4.1 缺失，除非你在正文中也完全找不到对应的粗体文本**。
+2. **页码偏差**：大纲中的页码是物理页序（从第1张纸开始算），而目录中的页码是逻辑页序（可能跳过封面）。请忽略 10 页以内的页码误差。
+3. **嵌套错误**：部分子章节可能被错误地挂载到了上一级章节。
 
 步骤：
 1. 在 <thinking> 标签内简要说明你的检查思路（聚焦格式）。
@@ -57,6 +60,24 @@ normative_prompt = """
 
 禁止输出：任何与内容正确性、语言风格、逻辑相关的意见。
 只给 3-10 个最关键的格式问题。
+"""
+
+vision_verify_prompt = """
+你是一个文档排版核查员。
+任务：验证文本分析提出的“格式问题”是否属实，还是仅仅因为PDF解析器没提取出来。
+
+【待验证问题】："{issue_description}"
+【当前页面截图】：(附图)
+
+请仔细观察图片：
+1. 如果问题是“缺少章节4.1”，请找页面上是否有 "4.1" 开头的标题。
+2. 如果问题是“页码错误”，请找页脚的页码数字。
+
+请输出 JSON：
+{{
+    "is_false_positive": true/false,
+    "reason": "简要说明理由，例如：'图片中明显可以看到 4.1 系统分析 这一行标题，位于页面中部...'"
+}}
 """
 
 logic_prompt = """
