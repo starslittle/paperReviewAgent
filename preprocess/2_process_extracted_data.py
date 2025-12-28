@@ -105,7 +105,7 @@ def json2df(root_path):
 
         elif re.search(r"/H(\d+)", item["Path"]) and "Text" in item:
 
-            heading_num = re.findall(r"/H(\d+)", rf"{item["Path"]}")[0]
+            heading_num = re.findall(r"/H(\d+)", rf"{item['Path']}")[0]
             heading_name = f"Heading {heading_num}"
             if style_list[-1] == heading_name:
                 data_list[-1] += " " + item["Text"]

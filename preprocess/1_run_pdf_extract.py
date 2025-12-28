@@ -13,7 +13,10 @@ import os
 from datetime import datetime
 from dotenv import load_dotenv
 
-load_dotenv()  # Load variables from .env file
+# Try to load .env from current dir or parent dir
+load_dotenv()
+if not os.getenv("ADOBE_CLIENT_ID"):
+    load_dotenv("../.env")
 
 from adobe.pdfservices.operation.auth.service_principal_credentials import (
     ServicePrincipalCredentials,
@@ -155,14 +158,33 @@ class ExtractTextTableInfoWithFiguresTablesRenditionsFromPDF:
 
 def main():
     os.makedirs(RESULT_DIR, exist_ok=True)
+    print(f"Scanning directory: {RAW_DATA_DIR}")
 
-    for file_path in glob.glob(RAW_DATA_DIR + "/*"):
+    # Ensure RAW_DATA_DIR path handling works for both relative and absolute paths
+    search_pattern = os.path.join(RAW_DATA_DIR, "*")
+    files = glob.glob(search_pattern)
+    print(f"Found {len(files)} items in {RAW_DATA_DIR}")
+
+    for file_path in files:
+        if not os.path.isdir(file_path):
+            continue
+
+        # 优先查找 document.pdf，如果不存在则查找该目录下任意一个 .pdf 文件
         pdf_path = os.path.join(file_path, "document.pdf")
         if not os.path.exists(pdf_path):
-            continue
+            pdf_files = glob.glob(os.path.join(file_path, "*.pdf"))
+            if pdf_files:
+                pdf_path = pdf_files[0]
+            else:
+                print(f"Skipping {file_path}: No PDF found")
+                continue
+
         sid = os.path.basename(file_path)
-        print(pdf_path)
-        ExtractTextTableInfoWithFiguresTablesRenditionsFromPDF(pdf_path, sid)
+        print(f"Found PDF: {pdf_path}")
+        try:
+            ExtractTextTableInfoWithFiguresTablesRenditionsFromPDF(pdf_path, sid)
+        except Exception as e:
+            print(f"Error processing {pdf_path}: {e}")
 
 
 if __name__ == "__main__":
