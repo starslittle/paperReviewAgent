@@ -42,7 +42,7 @@ normative_prompt = """
 {
   "issues": [
     {
-      "issue_type": "Format",
+      "issue_type": "规范性",
       "severity": "High|Medium|Low",
       "section": null,
       "page": null,
@@ -63,21 +63,106 @@ normative_prompt = """
 """
 
 vision_verify_prompt = """
-你是一个文档排版核查员。
-任务：验证文本分析提出的“格式问题”是否属实，还是仅仅因为PDF解析器没提取出来。
+你是一个文档排版核查员。你的任务是通过查看页面截图，验证文本分析提出的"格式问题"是真实存在，还是PDF解析器的误判。
 
-【待验证问题】："{issue_description}"
-【当前页面截图】：(附图)
+【待验证的问题】："{issue_description}"
+【当前页面截图】：(见附图)
 
-请仔细观察图片：
-1. 如果问题是“缺少章节4.1”，请找页面上是否有 "4.1" 开头的标题。
-2. 如果问题是“页码错误”，请找页脚的页码数字。
+请仔细观察截图，判断该问题是否为"误报 (False Positive)"：
 
-请输出 JSON：
+**判断标准**：
+- 如果问题是"缺少章节X.X"，请在截图中寻找是否有对应编号的章节标题
+  - **若截图中能找到该标题** → 说明PDF解析器遗漏了，问题是**误报**，`is_false_positive = true`
+  - **若截图中确实没有该标题** → 说明问题真实存在，`is_false_positive = false`
+
+- 如果问题是"页码错误"，请查看页脚的页码数字
+  - **若页码显示正确** → 问题是误报，`is_false_positive = true`
+  - **若页码确实错误或缺失** → 问题真实存在，`is_false_positive = false`
+
+**输出格式**（严格JSON）：
 {{
-    "is_false_positive": true/false,
-    "reason": "简要说明理由，例如：'图片中明显可以看到 4.1 系统分析 这一行标题，位于页面中部...'"
+    "is_false_positive": true或false,
+    "reason": "简要说明理由（1-2句话）"
 }}
+
+**示例1**（问题为误报）：
+输入：缺少章节"4.1 系统分析"
+截图：清晰显示有"4.1 系统分析"标题
+输出：{{"is_false_positive": true, "reason": "截图中第22页清晰显示'4.1 系统分析'标题位于页面上方，PDF解析器遗漏了该章节。"}}
+
+**示例2**（问题属实）：
+输入：缺少章节"2.2 YOLO模型"
+截图：只看到"2.1 目标检测"，没有2.2节
+输出：{{"is_false_positive": false, "reason": "截图中只显示2.1节标题，确实没有2.2节，问题属实。"}}
+"""
+
+local_chapter_review_prompt = """
+你是一名学术论文分章节审查员。你的任务是对给定的【单章内容】进行微观逻辑审查和摘要提取。
+
+请执行以下任务：
+1. **微观逻辑纠错 (Local Logic Review)**：
+   - 检查本章内部是否存在论证跳跃、前后矛盾。
+   - 检查语言是否学术化，是否存在口语表达。
+   - 检查段落衔接是否自然。
+
+2. **内容摘要提取 (Summarization)**：
+   - 用精炼的语言概括本章的核心论点、关键数据和结论（用于后续全局比对）。
+   - **重点**：如果这是“引言/摘要”章，请提取作者承诺要解决的问题；如果这是“结论”章，请提取作者声称已解决的问题。
+
+请在 <thinking> 标签内进行分析。
+然后输出 JSON（issue_type 必须从以下类型中选择：逻辑性、语言、连贯性）：
+{
+  "chapter_summary": "本章主要介绍了...核心论点是...数据表明...",
+  "issues": [
+    {
+      "issue_type": "逻辑性|语言|连贯性",
+      "severity": "High|Medium|Low",
+      "section": "本章标题",
+      "page": "相关页码（如果已知）",
+      "quote": "原文片段",
+      "suggestion": "修改建议"
+    }
+  ]
+}
+
+【issue_type 说明】：
+- "逻辑性"：论证跳跃、前后矛盾、论据不足等逻辑问题
+- "语言"：口语化表达、用词不规范、表述不学术等语言问题
+- "连贯性"：段落衔接不自然、章节过渡生硬等连贯性问题
+"""
+
+global_logic_review_prompt = """
+你是一名学术论文总审查员。你不再阅读数万字的原文，而是基于各章节的【高密度逻辑骨架】进行全局一致性检查。
+
+【输入素材】
+{global_context}
+
+【检查任务】
+1. **全局一致性 (Global Consistency)**：
+   - "摘要/引言"中承诺要解决的问题，在"结论"中是否都有回应？
+   - "方法"章节提出的算法，在"实验"章节是否都进行了验证？
+   - 各章节之间的逻辑流是否连贯？是否存在断层？
+
+请在 <thinking> 标签内进行深度分析（对比各章摘要）。
+然后输出 JSON：
+{{
+  "issues": [
+    {{
+      "issue_type": "逻辑性",
+      "severity": "High", // 全局逻辑矛盾通常是严重的
+      "section": "全局/跨章节",
+      "page": null,
+      "quote": "例如：'摘要承诺解决X问题' vs '结论未提及X'",
+      "suggestion": "修改建议"
+    }}
+  ]
+}}
+"""
+
+chapter_selection_prompt = """
+你是一名学术论文大纲分析助手。你的任务是从提供的 XML 大纲中选出最重要的“大章节” section_id 列表（不要返回小节如 1.1/1.2，尽量选择顶层章节）。
+
+请仅输出一个 JSON 数组，如 ["1", "2", "3"]，元素为字符串形式的 section_id，数量不超过 8。
 """
 
 logic_prompt = """
@@ -94,12 +179,12 @@ logic_prompt = """
    - 是否混入了非学术的口语（如“我觉得”、“超级”、“特别多”）。
    - 是否存在明显的逻辑重复/凑字数嫌疑。
 
-请在 <thinking> 标签内简述你的审查路径（例如：“我对比了摘要和结论，发现...”）。
+请在 <thinking> 标签内简述你的审查路径（例如："我对比了摘要和结论，发现..."）。
 在 <thinking> 标签后，只输出 JSON：
 {
   "issues": [
     {
-      "issue_type": "Logic",
+      "issue_type": "逻辑性",
       "severity": "High|Medium|Low", // High: 前后严重矛盾/核心论据缺失; Medium: 论证跳跃; Low: 口语化
       "section": "例如：3.2 实验分析",
       "page": null,
@@ -121,7 +206,7 @@ vision_prompt = """
 {
   "issues": [
     {
-      "issue_type": "Vision",
+      "issue_type": "图文一致性",
       "severity": "High|Medium|Low",
       "section": null,  // 如果不知道，填 null
       "page": null,     // 必须填写图片所在页码
@@ -139,12 +224,12 @@ reflection_prompt_template = """Please update the reflection listed within the <
 <guideline>{memory}</guideline>"""
 
 normative_logic_prompt = """
-你是一名严谨的学术审查员，请对以下论文内容做“规范性审查”和“逻辑审查”，只输出 JSON。
+你是一名严谨的学术审查员，请对以下论文内容做"规范性审查"和"逻辑审查"，只输出 JSON。
 输出格式：
 {
   "issues": [
     {
-      "issue_type": "Format|Logic",   // 规范性问题用 Format，逻辑问题用 Logic
+      "issue_type": "规范性|逻辑性",   // 规范性问题用"规范性"，逻辑问题用"逻辑性"
       "severity": "High|Medium|Low",
       "section": null,                // 如无法判断章节，填 null
       "page": null,                   // 如无法判断页码，填 null

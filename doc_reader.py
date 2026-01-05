@@ -316,7 +316,7 @@ class DocReader:
                                 and sub_child.text is not None
                             ):
                                 # Truncate caption text to 20 characters to save context length
-                                sub_child.text = sub_child.text[:20] 
+                                sub_child.text = sub_child.text[:20]
 
         root = copy.deepcopy(self.root)
         root.tag = "Outline"
@@ -326,6 +326,55 @@ class DocReader:
 
     def get_section_content(self, section_id):
         return self.section_dict[section_id]
+
+    def get_chapters(self):
+        """
+        Splits the document into chapters based on top-level sections (Heading 1).
+        Returns a list of dicts: [{'title': '...', 'content': '...', 'section_id': '...'}]
+        """
+        chapters = []
+        # Find all top-level sections (usually direct children of Root or Outline)
+        # Assuming the structure is Root -> Section (level 1) -> ...
+        # Based on preprocess logic, Section elements are nested.
+        # We want the top-most Section elements.
+
+        # In current XML structure:
+        # <Document>
+        #   <Section section_id="1" ...>
+        #     <Title>...</Title>
+        #     <Paragraph>...</Paragraph>
+        #     <Section section_id="1.1" ...>
+
+        for child in self.root:
+            if child.tag == "Section":
+                # This is a top-level chapter
+                sec_id = child.get("section_id")
+
+                # Extract title
+                title_text = "Unknown Chapter"
+                for node in child:
+                    if (
+                        node.tag == "Heading" and node.text
+                    ):  # Heading tag inside Section
+                        title_text = node.text
+                        break
+
+                # Extract content (recursively or just plain text of this subtree)
+                # We need a method to get full text of a subtree
+                content_text = "".join(child.itertext())
+
+                chapters.append(
+                    {"section_id": sec_id, "title": title_text, "content": content_text}
+                )
+
+        # If no sections found (e.g. flat structure), treat whole doc as one chapter
+        if not chapters:
+            full_text = "".join(self.root.itertext())
+            chapters.append(
+                {"section_id": "Full", "title": "Full Document", "content": full_text}
+            )
+
+        return chapters
 
     def get_image(self, image_id):
 

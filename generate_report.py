@@ -104,7 +104,7 @@ def generate_html(json_path, output_path):
 
             <div class="thinking-box">
                 <div class="thinking-header" onclick="toggle('thinking_norm')">
-                    <span>🧠 AI 思考过程：规范性审查 (Normative Review)</span>
+                    <span>🧠 AI 思考过程：规范性审查</span>
                     <span>▼</span>
                 </div>
                 <div id="thinking_norm" class="thinking-content markdown-content">
@@ -114,7 +114,7 @@ def generate_html(json_path, output_path):
 
             <div class="thinking-box">
                 <div class="thinking-header" onclick="toggle('thinking_logic')">
-                    <span>🧠 AI 思考过程：逻辑审查 (Logic Review)</span>
+                    <span>🧠 AI 思考过程：逻辑审查</span>
                     <span>▼</span>
                 </div>
                 <div id="thinking_logic" class="thinking-content markdown-content">
@@ -124,7 +124,7 @@ def generate_html(json_path, output_path):
 
             <div class="thinking-box" style="margin-bottom: 30px;">
                 <div class="thinking-header" onclick="toggle('thinking_vision')">
-                    <span>🧠 AI 思考过程：视觉审查 (Vision Review)</span>
+                    <span>🧠 AI 思考过程：视觉审查</span>
                     <span>▼</span>
                 </div>
                 <div id="thinking_vision" class="thinking-content markdown-content">
@@ -135,9 +135,26 @@ def generate_html(json_path, output_path):
             <h2>📝 详细修改建议</h2>
     """
 
+    # 定义英文到中文的类型映射（兜底用）
+    type_mapping = {
+        "Format": "规范性",
+        "Logic": "逻辑性",
+        "Language": "语言",
+        "Coherence": "连贯性",
+        "Cohesion": "连贯性",  # 兼容旧版拼写
+        "Vision": "图文一致性",
+        "Unknown": "未分类",
+    }
+
     for idx, issue in enumerate(issues):
         severity = issue.get("severity", "Medium")
-        issue_type = issue.get("issue_type", "Unknown")
+        raw_issue_type = issue.get("issue_type", "Unknown")
+        # 如果是英文类型，自动转换为中文
+        issue_type_base = type_mapping.get(raw_issue_type, raw_issue_type)
+        # 在类型后面加上"问题"
+        issue_type = (
+            f"{issue_type_base}问题" if issue_type_base != "未分类" else issue_type_base
+        )
         page = issue.get("page", "N/A")
         img_id = issue.get("image_id", "")
 
