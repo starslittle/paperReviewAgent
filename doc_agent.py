@@ -6,6 +6,7 @@ import xml.dom.minidom
 import xml.etree.ElementTree as ET
 
 from openai import OpenAI
+from pydantic_core.core_schema import nullable_schema
 
 from prompts import (
     actor_prompt_template,
@@ -47,6 +48,14 @@ class DocAgent:
         self.tool_call_wait_time = tool_call_wait_time
         # 用于在逻辑审查过程中暂存每章摘要，供全局阶段直接读取
         self.logic_memory = []
+
+        # ✅ 新增：跨章节共享的事实存储（用于细粒度冲突检测）
+        self.fact_store = {
+            "entities": {},  # 实体：人名、机构、角色等
+            "numbers": {},  # 数值：指标、参数、统计数据等
+            "dates": {},  # 时间：日期、时间线
+            "claims": [],  # 论断：重要观点和结论
+        }
 
     def _extract_plain_text(self, char_limit=6000):
         """Extract plain text segments for lightweight review."""
@@ -401,6 +410,238 @@ class DocAgent:
             print(f"[Warning] No verified issues remaining after vision verification!")
         return res
 
+    def _extract_chapter_facts(self, chapter_content, chapter_info):
+        """
+        从章节内容中提取细粒度事实（用于跨章节冲突检测）
+
+        Args:
+            chapter_content: 章节内容（XML字符串）
+            chapter_info: 章节信息字典（包含title, section_id, page等）
+
+        Returns:
+            dict: {"entities": [...], "numbers": [...], "dates": [...], "claims": [...]}
+        """
+        print(
+            f"[Fact Extraction] Extracting facts from: {chapter_info.get('title', 'Unknown')}"
+        )
+
+        fact_extraction_prompt = """
+你是一个精确的事实提取专家。请从以下章节内容中提取关键事实，用于后续的跨章节一致性验证。
+
+请提取以下类型的事实：
+
+1. **实体（Entities）**：人名、角色、机构、公司等
+   - 示例：{"type": "人物角色", "key": "甲方", "value": "张三"}
+   - 示例：{"type": "机构", "key": "项目单位", "value": "XX科技有限公司"}
+
+2. **数值（Numbers）**：性能指标、实验数据、统计数字等
+   - 示例：{"type": "性能指标", "key": "准确率", "value": 95.5, "unit": "%"}
+   - 示例：{"type": "实验数据", "key": "样本数量", "value": 1000, "unit": "个"}
+
+3. **时间（Dates）**：日期、时间节点、时间段等
+   - 示例：{"type": "时间节点", "key": "项目启动", "value": "2023年3月"}
+
+4. **重要论断（Claims）**：关键结论、核心观点（限5条最重要的）
+   - 示例：{"claim": "算法A在准确率上优于算法B", "type": "比较结论"}
+
+**注意**：
+- 只提取明确的事实，不要推断
+- 保留原文上下文片段（用于定位）
+- 如果某类事实不存在，返回空数组
+
+输出JSON格式：
+{
+  "entities": [
+    {"type": "人物角色", "key": "甲方", "value": "张三", "context": "根据合同约定，甲方为张三"}
+  ],
+  "numbers": [
+    {"type": "性能指标", "key": "准确率", "value": 95.5, "unit": "%", "context": "实验结果显示准确率达到95.5%"}
+  ],
+  "dates": [
+    {"type": "时间节点", "key": "项目启动", "value": "2023年3月", "context": "项目于2023年3月正式启动"}
+  ],
+  "claims": [
+    {"claim": "算法A优于算法B", "type": "比较结论", "context": "综合实验结果表明，算法A在各项指标上均优于算法B"}
+  ]
+}
+"""
+
+        # 限制内容长度（避免超token）
+        content_snippet = chapter_content[:8000]
+
+        messages = [
+            {"role": "system", "content": fact_extraction_prompt},
+            {
+                "role": "user",
+                "content": f"章节标题：{chapter_info.get('title', 'Unknown')}\n\n章节内容：\n{content_snippet}\n\n请提取关键事实。",
+            },
+        ]
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_id, messages=messages, max_tokens=4096, temperature=0.0
+            )
+            raw_response = response.choices[0].message.content
+            facts = self._parse_json(raw_response)
+
+            print(
+                f"[Fact Extraction] Extracted: {len(facts.get('entities', []))} entities, "
+                f"{len(facts.get('numbers', []))} numbers, "
+                f"{len(facts.get('dates', []))} dates, "
+                f"{len(facts.get('claims', []))} claims"
+            )
+
+            return facts
+
+        except Exception as e:
+            print(f"[Fact Extraction] Failed: {e}")
+            return {"entities": [], "numbers": [], "dates": [], "claims": []}
+
+    def _store_facts(self, facts, chapter_info):
+        """
+        将提取的事实存储到 self.fact_store 中
+
+        Args:
+            facts: _extract_chapter_facts 返回的字典
+            chapter_info: 章节信息（用于标注来源）
+        """
+        chapter_label = f"{chapter_info.get('title', 'Unknown')} (第{chapter_info.get('start_page_num', '?')}页)"
+
+        # 存储实体
+        for entity in facts.get("entities", []):
+            key = entity.get("key")  # 如"甲方"
+            if key:
+                if key not in self.fact_store["entities"]:
+                    self.fact_store["entities"][key] = []
+                self.fact_store["entities"][key].append(
+                    {
+                        "value": entity.get("value"),
+                        "type": entity.get("type"),
+                        "context": entity.get("context", ""),
+                        "source": chapter_label,
+                        "page": chapter_info.get("start_page_num"),
+                    }
+                )
+
+        # 存储数值
+        for number in facts.get("numbers", []):
+            key = number.get("key")  # 如"准确率"
+            if key:
+                if key not in self.fact_store["numbers"]:
+                    self.fact_store["numbers"][key] = []
+                self.fact_store["numbers"][key].append(
+                    {
+                        "value": number.get("value"),
+                        "unit": number.get("unit", ""),
+                        "type": number.get("type"),
+                        "context": number.get("context", ""),
+                        "source": chapter_label,
+                        "page": chapter_info.get("start_page_num"),
+                    }
+                )
+
+        # 存储时间
+        for date in facts.get("dates", []):
+            key = date.get("key")
+            if key:
+                if key not in self.fact_store["dates"]:
+                    self.fact_store["dates"][key] = []
+                self.fact_store["dates"][key].append(
+                    {
+                        "value": date.get("value"),
+                        "context": date.get("context", ""),
+                        "source": chapter_label,
+                        "page": chapter_info.get("start_page_num"),
+                    }
+                )
+
+        # 存储论断
+        for claim in facts.get("claims", []):
+            self.fact_store["claims"].append(
+                {
+                    "claim": claim.get("claim"),
+                    "type": claim.get("type"),
+                    "context": claim.get("context", ""),
+                    "source": chapter_label,
+                    "page": chapter_info.get("start_page_num"),
+                }
+            )
+
+    def _detect_fact_conflicts(self):
+        """
+        检测 fact_store 中的冲突
+
+        Returns:
+            list: 冲突问题列表
+        """
+        print("[Fact Conflict Detection] Analyzing cross-chapter conflicts...")
+        conflicts = []
+
+        # 1. 检测实体冲突（如"甲方"在不同章节有不同的值）
+        for entity_key, occurrences in self.fact_store["entities"].items():
+            if len(occurrences) > 1:
+                # 检查是否有不同的值
+                unique_values = set(occ["value"] for occ in occurrences if occ["value"])
+                if len(unique_values) > 1:
+                    conflicts.append(
+                        {
+                            "issue_type": "逻辑性-实体冲突",
+                            "severity": "High",
+                            "section": "跨章节",
+                            "page": occurrences[0]["page"],
+                            "quote": f"'{entity_key}' 在不同位置有不同的值：{', '.join(unique_values)}",
+                            "suggestion": (
+                                f"'{entity_key}' 的信息在文档中不一致。"
+                                f"出现位置："
+                                + "; ".join(
+                                    [
+                                        f"{occ['source']}为'{occ['value']}'"
+                                        for occ in occurrences[:3]
+                                    ]
+                                )
+                            ),
+                        }
+                    )
+
+        # 2. 检测数值冲突（如"准确率"在不同章节有明显差异）
+        for metric_key, occurrences in self.fact_store["numbers"].items():
+            if len(occurrences) > 1:
+                values = [
+                    occ["value"]
+                    for occ in occurrences
+                    if isinstance(occ["value"], (int, float))
+                ]
+                if len(values) > 1:
+                    # 检查数值差异（允许5%的误差范围）
+                    max_val = max(values)
+                    min_val = min(values)
+                    if max_val > 0 and (max_val - min_val) / max_val > 0.05:
+                        conflicts.append(
+                            {
+                                "issue_type": "逻辑性-数值冲突",
+                                "severity": "High",
+                                "section": "跨章节",
+                                "page": occurrences[0]["page"],
+                                "quote": f"'{metric_key}' 在不同位置有不同的数值",
+                                "suggestion": (
+                                    f"'{metric_key}' 的数值在文档中不一致（范围：{min_val}-{max_val}）。"
+                                    f"出现位置："
+                                    + "; ".join(
+                                        [
+                                            f"{occ['source']}为{occ['value']}{occ.get('unit', '')}"
+                                            for occ in occurrences[:3]
+                                        ]
+                                    )
+                                ),
+                            }
+                        )
+
+        # 3. 检测时间冲突（简单检查是否有明显的时序矛盾）
+        # TODO: 可以扩展时间线排序验证
+
+        print(f"[Fact Conflict Detection] Found {len(conflicts)} conflicts")
+        return conflicts
+
     def run_logic_review(self):
         """逻辑审查，不使用工具，返回包含 raw 和 thinking 的字典。"""
         print("[Agent] Starting Logic Review...")
@@ -416,6 +657,10 @@ class DocAgent:
         print("[Agent] Starting Hierarchical Logic Review...")
         # 重置逻辑内存
         self.logic_memory = []
+
+        # ✅ 重置事实存储（用于细粒度冲突检测）
+        self.fact_store = {"entities": {}, "numbers": {}, "dates": {}, "claims": []}
+        print("[Fact Store] Initialized for cross-chapter conflict detection")
 
         # Step 0: Let LLM select top/important sections
         top_sections = self.select_top_sections(max_sections=8)
@@ -542,6 +787,27 @@ class DocAgent:
                     f"[Logic Debug] Stored in logic_memory: section_id={memory_entry['section_id']}, title={memory_entry['title']}, summary_len={len(memory_entry['summary'])}"
                 )
 
+                # ✅ 新增：提取并存储细粒度事实（用于跨章节冲突检测）
+                try:
+                    chapter_facts = self._extract_chapter_facts(
+                        chapter_content=chap["content_xml"],
+                        chapter_info={
+                            "title": chap["title"],
+                            "section_id": chap.get("section_id"),
+                            "start_page_num": chap.get("start_page_num"),
+                        },
+                    )
+                    self._store_facts(
+                        chapter_facts,
+                        chapter_info={
+                            "title": chap["title"],
+                            "start_page_num": chap.get("start_page_num"),
+                        },
+                    )
+                except Exception as fact_error:
+                    print(f"[Fact Extraction] Failed for chapter {i+1}: {fact_error}")
+                    # 事实提取失败不影响主流程
+
                 map_results.append(
                     {
                         "title": chap["title"],
@@ -666,6 +932,16 @@ class DocAgent:
                 all_issues.extend(res["issues"])
             # Global issues
             all_issues.extend(global_data.get("issues", []))
+
+            # ✅ 新增：细粒度事实冲突检测
+            print(
+                "\n[Fact Conflict Detection] Starting cross-chapter fact verification..."
+            )
+            fact_conflicts = self._detect_fact_conflicts()
+            all_issues.extend(fact_conflicts)
+            print(
+                f"[Fact Conflict Detection] Added {len(fact_conflicts)} conflict issues\n"
+            )
 
             # 为无页码的 issue 做兜底填充（优先按章节标题/section_id匹配其起始页，再尝试quote匹配，否则用首章节页码）
             for issue in all_issues:
@@ -917,21 +1193,21 @@ class DocAgent:
                         continue
                 try:
                     page_media_type, page_base64_img, page_err = (
-                            self.doc_reader.get_page_image(p_num)
+                        self.doc_reader.get_page_image(p_num)
                     )
                     if not page_err:
-                            # 明确标注页面顺序：前一页、当前页、后一页
-                            label = (
-                                page_labels[idx]
-                                if idx < len(page_labels)
-                                else f"Page {p_num}"
-                            )
-                            page_image_block.append(
-                                {
-                                    "type": "text",
-                                    "text": f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n【{label}：Page {p_num}】\n请仔细查看本页是否包含目标图片，以及是否有相关的Caption或正文描述。\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                                }
-                            )
+                        # 明确标注页面顺序：前一页、当前页、后一页
+                        label = (
+                            page_labels[idx]
+                            if idx < len(page_labels)
+                            else f"Page {p_num}"
+                        )
+                        page_image_block.append(
+                            {
+                                "type": "text",
+                                "text": f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n【{label}：Page {p_num}】\n请仔细查看本页是否包含目标图片，以及是否有相关的Caption或正文描述。\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                            }
+                        )
                         page_image_block.append(
                             {
                                 "type": "image_url",
@@ -942,7 +1218,7 @@ class DocAgent:
                         )
                 except Exception as e:
                     print(
-                            f"[Agent] [Vision] Failed to attach page image for page {p_num}: {e}"
+                        f"[Agent] [Vision] Failed to attach page image for page {p_num}: {e}"
                     )
 
             # Construct message for Vision Model

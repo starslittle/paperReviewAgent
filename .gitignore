@@ -23,6 +23,7 @@ coverage.xml
 # IDEs
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 .DS_Store
