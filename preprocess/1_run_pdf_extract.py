@@ -1,190 +1,137 @@
 """
-Copyright 2024 Adobe
-All Rights Reserved.
-
-NOTICE: Adobe permits you to use, modify, and distribute this file in
-accordance with the terms of the Adobe license agreement accompanying it.
+PDF 提取脚本 - pdfplumber 版
+功能：本地解析 PDF，提取文本、字体名称、字体大小及坐标，用于格式一致性检查。
 """
 
 import argparse
 import glob
 import logging
 import os
-from datetime import datetime
-from dotenv import load_dotenv
+import json
 
-# Try to load .env from current dir or parent dir
-load_dotenv()
-if not os.getenv("ADOBE_CLIENT_ID"):
-    load_dotenv("../.env")
+# 导入 pdfplumber
+try:
+    import pdfplumber
+except ImportError:
+    print("错误: 缺少必要库，请执行: pip install pdfplumber")
+    exit(1)
 
-from adobe.pdfservices.operation.auth.service_principal_credentials import (
-    ServicePrincipalCredentials,
+# 初始化日志
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-from adobe.pdfservices.operation.exception.exceptions import (
-    SdkException,
-    ServiceApiException,
-    ServiceUsageException,
-)
-from adobe.pdfservices.operation.io.cloud_asset import CloudAsset
-from adobe.pdfservices.operation.io.stream_asset import StreamAsset
-from adobe.pdfservices.operation.pdf_services import PDFServices
-import argparse
-from adobe.pdfservices.operation.pdf_services_media_type import PDFServicesMediaType
-from adobe.pdfservices.operation.pdfjobs.jobs.extract_pdf_job import ExtractPDFJob
-from adobe.pdfservices.operation.pdfjobs.params.extract_pdf.extract_element_type import (
-    ExtractElementType,
-)
-from adobe.pdfservices.operation.pdfjobs.params.extract_pdf.extract_pdf_params import (
-    ExtractPDFParams,
-)
-from adobe.pdfservices.operation.pdfjobs.params.extract_pdf.extract_renditions_element_type import (
-    ExtractRenditionsElementType,
-)
-from adobe.pdfservices.operation.pdfjobs.result.extract_pdf_result import (
-    ExtractPDFResult,
-)
-
-# Initialize the logger
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="Extract text and tables from PDF files"
-    )
-    # parser.add_argument("--client-id", default="9871642959ea4f2c8ec67483a1044e92",
-    #                     help="PDF Services Client ID")
-    parser.add_argument(
-        "--client-id",
-        default=os.getenv("ADOBE_CLIENT_ID"),
-        help="PDF Services Client ID",
-    )
-    parser.add_argument(
-        "--client-secret",
-        default=os.getenv("ADOBE_CLIENT_SECRET"),
-        help="PDF Services Client Secret",
-    )
-    parser.add_argument(
-        "--raw-data-dir",
-        default="../sample_data/",
-        help="Directory containing raw PDF files",
-    )
-    parser.add_argument(
-        "--result-dir", default="./extract_output/", help="Directory for output results"
-    )
-    return parser.parse_args()
+class PDFPlumberExtractor:
+    def __init__(self):
+        pass
 
+    def extract_pdf(self, pdf_path, sid, result_dir):
+        # 输出目录：./extract_output/{sid}/MinerU/ (保留原目录名以维持一致性)
+        output_dir = os.path.join(result_dir, sid, "MinerU")
+        os.makedirs(output_dir, exist_ok=True)
 
-args = parse_arguments()
-
-PDF_SERVICES_CLIENT_ID = args.client_id
-PDF_SERVICES_CLIENT_SECRET = args.client_secret
-RAW_DATA_DIR = args.raw_data_dir
-RESULT_DIR = args.result_dir
-
-
-#
-# This sample illustrates how to extract Text, Table Elements Information from PDF along with renditions of Figure,
-# Table elements.
-#
-# Refer to README.md for instructions on how to run the samples & understand output zip file.
-#
-class ExtractTextTableInfoWithFiguresTablesRenditionsFromPDF:
-    def __init__(self, file_path, sid):
-        # Creates an output stream and copy stream asset's content to it
-        output_file_path = self.create_output_file_path(sid)
-        if os.path.exists(output_file_path):
-            return
+        output_json = os.path.join(output_dir, "middle.json")
 
         try:
-            file = open(file_path, "rb")
-            input_stream = file.read()
-            file.close()
+            logger.info(f"[→] 正在使用 pdfplumber 解析: {os.path.basename(pdf_path)}")
 
-            # Initial setup, create credentials instance
-            credentials = ServicePrincipalCredentials(
-                client_id=PDF_SERVICES_CLIENT_ID,
-                client_secret=PDF_SERVICES_CLIENT_SECRET,
-            )
+            data_list = []
 
-            # Creates a PDF Services instance
-            pdf_services = PDFServices(credentials=credentials)
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_idx, page in enumerate(pdf.pages):
+                    # 提取该页的所有文本块（带有字体信息）
+                    words = page.extract_words(
+                        extra_attrs=["fontname", "size"], horizontal_ltr=True
+                    )
 
-            # Creates an asset(s) from source file(s) and upload
-            input_asset = pdf_services.upload(
-                input_stream=input_stream, mime_type=PDFServicesMediaType.PDF
-            )
+                    for word in words:
+                        item = {
+                            "type": "text",
+                            "text": word["text"],
+                            "font_name": word["fontname"],
+                            "font_size": round(word["size"], 2),
+                            "bbox": [
+                                round(float(word["x0"]), 2),
+                                round(float(word["top"]), 2),
+                                round(float(word["x1"]), 2),
+                                round(float(word["bottom"]), 2),
+                            ],
+                            "page_idx": page_idx,
+                        }
+                        data_list.append(item)
 
-            # Create parameters for the job
-            extract_pdf_params = ExtractPDFParams(
-                elements_to_extract=[
-                    ExtractElementType.TEXT,
-                    ExtractElementType.TABLES,
-                ],
-                elements_to_extract_renditions=[
-                    ExtractRenditionsElementType.TABLES,
-                    ExtractRenditionsElementType.FIGURES,
-                ],
-            )
+            # 保存结果
+            with open(output_json, "w", encoding="utf-8") as f:
+                json.dump(data_list, f, ensure_ascii=False, indent=4)
 
-            # Creates a new job instance
-            extract_pdf_job = ExtractPDFJob(
-                input_asset=input_asset, extract_pdf_params=extract_pdf_params
-            )
+            # 同时生成一个简单的 markdown 用于预览
+            self._generate_preview_md(data_list, os.path.join(output_dir, "full.md"))
 
-            # Submit the job and gets the job result
-            location = pdf_services.submit(extract_pdf_job)
-            pdf_services_response = pdf_services.get_job_result(
-                location, ExtractPDFResult
-            )
+            logger.info(f"[✓] 文档 {sid} 处理完成，结果保存至 {output_json}")
+            return True
 
-            # Get content from the resulting asset(s)
-            result_asset: CloudAsset = pdf_services_response.get_result().get_resource()
-            stream_asset: StreamAsset = pdf_services.get_content(result_asset)
+        except Exception as e:
+            logger.error(f"[✗] 解析异常: {e}")
+            return False
 
-            with open(output_file_path, "wb") as file:
-                file.write(stream_asset.get_input_stream())
+    def _generate_preview_md(self, data_list, md_path):
+        """生成一个简单的预览 Markdown"""
+        with open(md_path, "w", encoding="utf-8") as f:
+            current_page = -1
+            for item in data_list:
+                if item["page_idx"] != current_page:
+                    current_page = item["page_idx"]
+                    f.write(f"\n\n<!-- Page {current_page + 1} -->\n\n")
 
-        except (ServiceApiException, ServiceUsageException, SdkException) as e:
-            logging.exception(f"Exception encountered while executing operation: {e}")
-            exit()
-
-    # Generates a string containing a directory structure and file name for the output file
-    @staticmethod
-    def create_output_file_path(sid) -> str:
-        return f"{RESULT_DIR}/{sid}.zip"
+                # 根据字体大小简单判定是否可能是标题（例如 > 14pt）
+                if item["font_size"] > 14:
+                    f.write(f"### {item['text']} ")
+                else:
+                    f.write(f"{item['text']} ")
 
 
 def main():
-    os.makedirs(RESULT_DIR, exist_ok=True)
-    print(f"Scanning directory: {RAW_DATA_DIR}")
+    parser = argparse.ArgumentParser(description="PDF 提取脚本 (pdfplumber)")
+    parser.add_argument(
+        "--raw-data-dir", default="../sample_data/", help="原始数据目录"
+    )
+    parser.add_argument(
+        "--result-dir", default="./extract_output/", help="输出结果目录"
+    )
+    parser.add_argument("--doc-id", type=str, default=None, help="指定处理的文档 ID")
+    args = parser.parse_args()
 
-    # Ensure RAW_DATA_DIR path handling works for both relative and absolute paths
-    search_pattern = os.path.join(RAW_DATA_DIR, "*")
-    files = glob.glob(search_pattern)
-    print(f"Found {len(files)} items in {RAW_DATA_DIR}")
+    os.makedirs(args.result_dir, exist_ok=True)
+    extractor = PDFPlumberExtractor()
 
-    for file_path in files:
-        if not os.path.isdir(file_path):
+    search_path = os.path.join(args.raw_data_dir, "*")
+    pdf_count = 0
+
+    all_items = glob.glob(search_path)
+    for item in all_items:
+        if not os.path.isdir(item):
+            continue
+        sid = os.path.basename(item)
+        if args.doc_id and sid != args.doc_id:
             continue
 
-        # 优先查找 document.pdf，如果不存在则查找该目录下任意一个 .pdf 文件
-        pdf_path = os.path.join(file_path, "document.pdf")
-        if not os.path.exists(pdf_path):
-            pdf_files = glob.glob(os.path.join(file_path, "*.pdf"))
-            if pdf_files:
-                pdf_path = pdf_files[0]
+        # 查找PDF
+        pdf_list = glob.glob(os.path.join(item, "*.pdf"))
+        if not pdf_list:
+            if os.path.exists(os.path.join(item, "document.pdf")):
+                pdf_list = [os.path.join(item, "document.pdf")]
             else:
-                print(f"Skipping {file_path}: No PDF found")
                 continue
 
-        sid = os.path.basename(file_path)
-        print(f"Found PDF: {pdf_path}")
-        try:
-            ExtractTextTableInfoWithFiguresTablesRenditionsFromPDF(pdf_path, sid)
-        except Exception as e:
-            print(f"Error processing {pdf_path}: {e}")
+        pdf_count += 1
+        logger.info(f"\n{'='*60}")
+        logger.info(f"[{pdf_count}] 处理文档: {sid}")
+        logger.info(f"{'='*60}")
+        extractor.extract_pdf(pdf_list[0], sid, args.result_dir)
+
+    logger.info(f"\n[✓] 全部处理完成，共处理 {pdf_count} 个文档")
 
 
 if __name__ == "__main__":

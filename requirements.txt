@@ -20,6 +20,10 @@ pdfservices-sdk>=4.2.0
 python-dotenv>=1.0.0
 tqdm>=4.67.1
 
+# OCR (for enhanced heading detection)
+paddlepaddle>=2.6.0
+paddleocr>=2.7.0
+
 # Standard library dependencies (no installation needed)
 # - json
 # - re
