@@ -5,8 +5,9 @@ import os
 import xml.etree.ElementTree as ET
 from typing import Optional, Tuple
 
-import pandas as pd
 from PIL import Image
+
+from preprocess.doc_ir_builder import DocIRBuilder
 
 
 def process_image(image_path: str) -> Tuple[str, str, Optional[str]]:
@@ -103,190 +104,19 @@ class DocReader:
 
     def __init__(self, data_path, max_section_depth=10):
         self.data_path = data_path
-        self.data = pd.read_pickle(self.data_path + "/data.pkl")
+        builder = DocIRBuilder(max_section_depth=max_section_depth)
+        result = builder.build_from_pkl(data_path)
 
-        prev_heading_num = 0
-        self.root = ET.Element("Document")
-        prev_node = self.root
-        stack = [(prev_node, prev_heading_num)]
-        self.image_count, self.table_count, self.para_count = 0, 0, 0
-
-        self.section_dict = dict()
-        self.image_path_dict = dict()
-        self.table_image_path_dict = dict()
-        prev_section_id = ""  # root id
-        self.num_page = len(glob.glob(self.data_path + "/page_images/*.png"))
+        self.doc_ir = result.doc_ir
+        self.root = result.root
+        self.section_dict = result.section_dict
+        self.image_path_dict = result.image_path_dict
+        self.table_image_path_dict = result.table_image_path_dict
+        self.num_page = result.num_page
+        self.image_count = result.image_count
+        self.table_count = result.table_count
+        self.para_count = result.para_count
         self.max_section_depth = max_section_depth
-
-        index = 0
-        curr_page_num = 1
-        if not self.data.iloc[0]["style"].startswith(
-            "Heading"
-        ):  # if first element is not heading
-            curr_section_id = "1"
-            curr_node = ET.SubElement(
-                prev_node,
-                "Section",
-                section_id=curr_section_id,
-                start_page_num=str(curr_page_num),
-            )
-
-            self.section_dict[curr_section_id] = curr_node
-            stack.append([curr_node, 1])
-
-            prev_section_id = curr_section_id
-            prev_node = curr_node
-
-        while index < len(self.data):
-            row = self.data.iloc[index]
-
-            if row["style"].startswith("Heading"):
-                curr_heading_num = int(row["style"].split()[1])
-
-                while (
-                    curr_heading_num < stack[-1][1]
-                ):  # curr element is of higher rank than prev element
-                    stack[-1][0].set("end_page_num", str(curr_page_num))
-                    stack.pop()
-                    prev_section_id_list = prev_section_id.split(".")
-                    prev_section_id = ".".join(prev_section_id_list[:-1])
-
-                if (
-                    curr_heading_num == stack[-1][1]
-                ):  # curr element is of equal rank of prev element
-                    stack[-1][0].set("end_page_num", str(curr_page_num))
-                    curr_section_id_list = prev_section_id.split(".")
-                    curr_section_id_list[-1] = str(int(curr_section_id_list[-1]) + 1)
-                    curr_section_id = ".".join(curr_section_id_list)
-                    prev_node = stack[-2][0]
-
-                    curr_node = ET.SubElement(
-                        prev_node,
-                        "Section",
-                        section_id=curr_section_id,
-                        start_page_num=str(curr_page_num),
-                    )
-                    self.section_dict[curr_section_id] = curr_node
-                    heading = ET.SubElement(curr_node, "Heading")
-                    heading.text = row["para_text"].strip()
-
-                    stack[-1][0] = curr_node
-
-                else:  # curr element is of lower rank than prev element
-                    if len(stack) <= self.max_section_depth:
-                        prev_node = stack[-1][0]
-                        curr_section_id = prev_section_id + ".1"
-                        curr_node = ET.SubElement(
-                            prev_node,
-                            "Section",
-                            section_id=curr_section_id,
-                            start_page_num=str(curr_page_num),
-                        )
-                        self.section_dict[curr_section_id] = curr_node
-                        heading = ET.SubElement(curr_node, "Heading")
-                        heading.text = row["para_text"].strip()
-
-                        stack.append([curr_node, curr_heading_num])
-                    else:
-                        # view as paragraph to avoid too deep section
-                        content = row["para_text"]
-                        while index + 1 < len(self.data) and self.data.iloc[index + 1][
-                            "style"
-                        ] in ["Normal", "Body Text", "List Paragraph", "Footnote"]:
-                            index += 1
-                            content = content + " " + self.data.iloc[index]["para_text"]
-
-                        para = ET.SubElement(
-                            prev_node, "Paragraph", page_num=str(curr_page_num)
-                        )
-                        para.text = content
-
-                        self.para_count += 1
-                        index += 1
-                        continue  # do not update prev_node and prev_section_id
-
-                prev_section_id = curr_section_id
-                prev_node = curr_node
-
-            elif row["style"] in ["Normal", "Body Text", "List Paragraph", "Footnote"]:
-                curr_style = row["style"]
-                content = row["para_text"]
-                while (
-                    index + 1 < len(self.data)
-                    and self.data.iloc[index + 1]["style"] == curr_style
-                ):
-                    index += 1
-                    content = content + " " + self.data.iloc[index]["para_text"]
-
-                para = ET.SubElement(
-                    prev_node, "Paragraph", page_num=str(curr_page_num)
-                )
-                para.text = content
-
-                self.para_count += 1
-
-            elif row["style"] == "Image":
-                item = row["para_text"]
-                image = ET.SubElement(
-                    prev_node,
-                    "Image",
-                    image_id=str(self.image_count),
-                    page_num=str(curr_page_num),
-                )
-                self.image_path_dict[str(self.image_count)] = os.path.basename(
-                    item["path"]
-                )
-
-                if item["alt_text"] is not None:
-
-                    alt_text = ET.SubElement(image, "Alt_Text")
-                    alt_text.text = str(item["alt_text"])
-                self.image_count += 1
-
-            elif row["style"] == "Caption":
-                prev_row = self.data.iloc[index - 1]
-                if prev_row["style"] == "Image":
-                    caption = ET.SubElement(image, "Caption")
-                else:
-                    caption = ET.SubElement(prev_node, "Caption")
-
-                caption.text = str(row["para_text"])
-
-            elif row["style"] == "Table":
-
-                if len(row["para_text"]) == 0 or "content" not in row["para_text"]:
-                    index += 1
-                    continue
-                table = ET.SubElement(
-                    prev_node,
-                    "CSV_Table",
-                    table_id=str(self.table_count),
-                    page_num=str(curr_page_num),
-                )
-
-                table.text = row["para_text"]["content"]
-                if "image_path" in row["para_text"]:
-                    self.table_image_path_dict[str(self.table_count)] = row[
-                        "para_text"
-                    ]["image_path"]
-                self.table_count += 1
-
-            elif row["style"] == "Page_Start":
-                curr_page_num = row["table_id"]
-
-            elif row["style"] == "Title":
-                content = row["para_text"]
-
-                para = ET.SubElement(prev_node, "Title", page_num=str(curr_page_num))
-                para.text = content
-
-            else:
-                print("Uncovered style:", row["style"])
-                raise Exception
-            index += 1
-        for i in range(len(stack)):
-            if stack[i][0].tag == "Section":
-                stack[i][0].set("end_page_num", str(curr_page_num))
 
     def get_outline_root(
         self, skip_para_after_page=100, disable_caption_after_page=False

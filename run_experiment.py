@@ -5,8 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import doc_agent
-import doc_reader
+from agent import doc_agent
+from agent import doc_reader
 
 parser = argparse.ArgumentParser(description="Run experiment")
 parser.add_argument(

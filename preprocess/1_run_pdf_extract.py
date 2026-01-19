@@ -1,20 +1,32 @@
 """
-PDF 提取脚本 - pdfplumber 版
-功能：本地解析 PDF，提取文本、字体名称、字体大小及坐标，用于格式一致性检查。
+MinerU PDF 提取脚本
+功能：使用 MinerU API 解析 PDF，提取文本、字体、布局等信息
 """
 
 import argparse
 import glob
 import logging
 import os
-import json
+import time
+import zipfile
+import io
+import shutil
+from dotenv import load_dotenv
 
-# 导入 pdfplumber
+# 导入必要的库
 try:
-    import pdfplumber
+    # 用于 API 交互
+    from curl_cffi import requests as cffi_requests
+    # 用于文件上传
+    import requests as std_requests
 except ImportError:
-    print("错误: 缺少必要库，请执行: pip install pdfplumber")
+    print("错误: 缺少必要库，请执行: pip install curl_cffi requests")
     exit(1)
+
+# 加载环境变量
+load_dotenv()
+if not os.getenv("MINERU_API_TOKEN"):
+    load_dotenv("../.env")
 
 # 初始化日志
 logging.basicConfig(
@@ -23,77 +35,246 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class PDFPlumberExtractor:
-    def __init__(self):
-        pass
+class MinerUExtractor:
+    def __init__(self, api_token=None, base_url=None):
+        self.api_token = api_token or os.getenv("MINERU_API_TOKEN")
+        self.base_url = (
+            base_url or os.getenv("MINERU_API_BASE_URL", "https://mineru.net/api/v4")
+        ).rstrip("/")
+
+        # 创建 curl_cffi Session (用于 API 请求)
+        self.session = cffi_requests.Session()
+        self.impersonate = "chrome120"
+
+        # 设置 API 请求头
+        self.session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Authorization": f"Bearer {self.api_token}",
+            }
+        )
+
+        if not self.api_token:
+            logger.error("未找到 MINERU_API_TOKEN，请检查环境变量配置")
+            exit(1)
 
     def extract_pdf(self, pdf_path, sid, result_dir):
-        # 输出目录：./extract_output/{sid}/MinerU/ (保留原目录名以维持一致性)
+        """
+        使用 MinerU API 提取 PDF 内容
+
+        Args:
+            pdf_path: PDF 文件路径
+            sid: 文档 ID
+            result_dir: 结果输出根目录
+
+        Returns:
+            bool: 是否成功
+        """
+        # 输出目录：./extract_output/{sid}/MinerU/
         output_dir = os.path.join(result_dir, sid, "MinerU")
         os.makedirs(output_dir, exist_ok=True)
 
-        output_json = os.path.join(output_dir, "middle.json")
-
-        try:
-            logger.info(f"[→] 正在使用 pdfplumber 解析: {os.path.basename(pdf_path)}")
-
-            data_list = []
-
-            with pdfplumber.open(pdf_path) as pdf:
-                for page_idx, page in enumerate(pdf.pages):
-                    # 提取该页的所有文本块（带有字体信息）
-                    words = page.extract_words(
-                        extra_attrs=["fontname", "size"], horizontal_ltr=True
-                    )
-
-                    for word in words:
-                        item = {
-                            "type": "text",
-                            "text": word["text"],
-                            "font_name": word["fontname"],
-                            "font_size": round(word["size"], 2),
-                            "bbox": [
-                                round(float(word["x0"]), 2),
-                                round(float(word["top"]), 2),
-                                round(float(word["x1"]), 2),
-                                round(float(word["bottom"]), 2),
-                            ],
-                            "page_idx": page_idx,
-                        }
-                        data_list.append(item)
-
-            # 保存结果
-            with open(output_json, "w", encoding="utf-8") as f:
-                json.dump(data_list, f, ensure_ascii=False, indent=4)
-
-            # 同时生成一个简单的 markdown 用于预览
-            self._generate_preview_md(data_list, os.path.join(output_dir, "full.md"))
-
-            logger.info(f"[✓] 文档 {sid} 处理完成，结果保存至 {output_json}")
+        # 检查本地是否已有结果
+        if os.path.exists(os.path.join(output_dir, "middle.json")):
+            logger.info(f"[MinerU] 文档 {sid} 已处理过，跳过")
             return True
 
-        except Exception as e:
-            logger.error(f"[✗] 解析异常: {e}")
+        # 1. 提交任务 (申请链接 -> 上传文件)
+        batch_id = self._submit_task(pdf_path)
+        if not batch_id:
             return False
 
-    def _generate_preview_md(self, data_list, md_path):
-        """生成一个简单的预览 Markdown"""
-        with open(md_path, "w", encoding="utf-8") as f:
-            current_page = -1
-            for item in data_list:
-                if item["page_idx"] != current_page:
-                    current_page = item["page_idx"]
-                    f.write(f"\n\n<!-- Page {current_page + 1} -->\n\n")
+        # 2. 等待完成 (使用批量查询接口)
+        result_url = self._wait_for_completion(batch_id)
+        if not result_url:
+            return False
 
-                # 根据字体大小简单判定是否可能是标题（例如 > 14pt）
-                if item["font_size"] > 14:
-                    f.write(f"### {item['text']} ")
+        # 3. 下载结果
+        success = self._download_and_extract(result_url, output_dir)
+        if success:
+            logger.info(f"[✓] 文档 {sid} 处理完成")
+        return success
+
+    def _submit_task(self, pdf_path):
+        """
+        步骤一：提交任务
+        1. 申请上传链接
+        2. 上传文件
+        """
+        apply_url = f"{self.base_url}/file-urls/batch"
+        filename = os.path.basename(pdf_path)
+
+        try:
+            logger.info(f"[→] 正在申请上传链接: {filename}")
+
+            payload = {"files": [{"name": filename, "data_id": "doc_1"}]}
+
+            # 1. 申请链接
+            resp_apply = self.session.post(
+                apply_url, json=payload, impersonate=self.impersonate, timeout=30
+            )
+
+            if resp_apply.status_code != 200:
+                logger.error(f"[✗] 申请链接失败: {resp_apply.text}")
+                return None
+
+            res_json = resp_apply.json()
+            if res_json.get("code") != 0:
+                logger.error(f"[✗] API拒绝申请: {res_json.get('msg')}")
+                return None
+
+            batch_id = res_json["data"]["batch_id"]
+            upload_url = res_json["data"]["file_urls"][0]
+
+            logger.info("[→] 链接申请成功，正在上传文件数据...")
+
+            # 2. 上传文件 (使用标准 requests，不带额外 Header)
+            with open(pdf_path, "rb") as f:
+                file_content = f.read()
+
+                # 直接 PUT 二进制，timeout 设置长一点
+                resp_upload = std_requests.put(
+                    upload_url, data=file_content, timeout=300
+                )
+
+            if resp_upload.status_code != 200:
+                logger.error(f"[✗] 文件上传失败 HTTP {resp_upload.status_code}")
+                logger.error(f"    详情: {resp_upload.text[:200]}")
+                return None
+
+            logger.info(f"[✓] 文件上传成功! Batch ID: {batch_id}")
+            return batch_id
+
+        except Exception as e:
+            logger.error(f"[✗] 提交异常: {e}")
+            return None
+
+    def _wait_for_completion(self, batch_id, max_wait_time=600):
+        """
+        步骤二：等待任务完成
+        """
+        url = f"{self.base_url}/extract-results/batch/{batch_id}"
+        start_time = time.time()
+        logger.info(f"[⏳] 开始轮询任务状态 (Batch ID: {batch_id})...")
+
+        while (time.time() - start_time) < max_wait_time:
+            try:
+                response = self.session.get(
+                    url, impersonate=self.impersonate, timeout=20
+                )
+
+                if response.status_code != 200:
+                    logger.warning(f"查询状态失败 HTTP {response.status_code}")
+                    time.sleep(5)
+                    continue
+
+                res_json = response.json()
+                data = res_json.get("data", {})
+
+                # 提取结果列表
+                results = data.get("extract_result", [])
+                if not results:
+                    results = data.get("count", [])
+
+                if not results:
+                    time.sleep(5)
+                    continue
+
+                # 取第一个文件的结果
+                item = results[0]
+
+                # 获取状态字段
+                state = item.get("state") or item.get("status")
+
+                # 判断状态值
+                if state in ["done", "success"]:
+                    # 获取下载链接
+                    download_url = item.get("full_zip_url") or item.get("full_res")
+                    logger.info("[✓] 解析成功")
+                    return download_url
+
+                elif state in ["failed", "error"]:
+                    error_msg = item.get("error_msg", "未知错误")
+                    logger.error(f"[✗] 解析失败: {error_msg}")
+                    return None
+
                 else:
-                    f.write(f"{item['text']} ")
+                    # 仍在处理中
+                    elapsed = int(time.time() - start_time)
+                    if elapsed % 10 == 0:
+                        logger.info(f"[⏳] 解析中... (当前状态: {state})")
+                    time.sleep(5)
+
+            except Exception as e:
+                logger.warning(f"轮询异常: {e}")
+                time.sleep(5)
+
+        logger.error(f"[✗] 任务等待超时 ({max_wait_time}秒)")
+        return None
+
+    def _download_and_extract(self, result_url, output_dir):
+        """
+        步骤三：下载并解压结果
+        """
+        try:
+            logger.info("[↓] 正在下载结果包...")
+            response = self.session.get(
+                result_url, impersonate=self.impersonate, timeout=120
+            )
+
+            if response.status_code != 200:
+                logger.error(f"[✗] 下载失败 HTTP {response.status_code}")
+                return False
+
+            # 解压
+            with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+                z.extractall(output_dir)
+
+            # 扫描目录中的文件
+            logger.info(f"📂 正在扫描目录 {output_dir} ...")
+            file_list = []
+            for root, dirs, files in os.walk(output_dir):
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, output_dir)
+                    file_list.append(rel_path)
+                    logger.info(f"   📄 发现文件: {rel_path}")
+
+            # 寻找 middle.json 文件
+            found_json = None
+
+            for f in file_list:
+                if f.endswith("middle.json"):
+                    found_json = f
+                    break
+                # 兼容其他可能的命名
+                if f.endswith("model.json"):
+                    found_json = f
+
+            if found_json:
+                src_path = os.path.join(output_dir, found_json)
+                dst_path = os.path.join(output_dir, "middle.json")
+
+                # 如果文件不在根目录，移动并重命名
+                if src_path != dst_path:
+                    if os.path.exists(dst_path):
+                        os.remove(dst_path)
+                    shutil.move(src_path, dst_path)
+                    logger.info(f"[✓] 已将 {found_json} 移动并重命名为 middle.json")
+                return True
+            else:
+                logger.warning(
+                    "[!] 未找到 middle.json，请检查上方打印的文件列表"
+                )
+                return False
+
+        except Exception as e:
+            logger.error(f"下载解压失败: {e}")
+            return False
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PDF 提取脚本 (pdfplumber)")
+    parser = argparse.ArgumentParser(description="MinerU PDF 提取脚本")
     parser.add_argument(
         "--raw-data-dir", default="../sample_data/", help="原始数据目录"
     )
@@ -104,7 +285,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.result_dir, exist_ok=True)
-    extractor = PDFPlumberExtractor()
+    extractor = MinerUExtractor()
 
     search_path = os.path.join(args.raw_data_dir, "*")
     pdf_count = 0

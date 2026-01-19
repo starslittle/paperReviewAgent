@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from openai import OpenAI
 from pydantic_core.core_schema import nullable_schema
 
-from prompts import (
+from .prompts import (
     actor_prompt_template,
     available_tools,
     chapter_selection_prompt,
