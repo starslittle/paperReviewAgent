@@ -177,17 +177,21 @@ class DocAgent:
                     best_page = page
         return best_page
 
-    def select_top_sections(self, max_sections=8):
+    def select_top_sections(self, max_sections=8, skip_front_matter=True):
         """
         Use LLM to select top-level (or important) sections from Outline XML.
         Returns a list of section_id strings.
+
+        Args:
+            max_sections: Maximum number of sections to select
+            skip_front_matter: Whether to skip front matter (cover, commitment, etc.)
         """
         outline_xml = self.get_outline()
         messages = [
             {"role": "system", "content": chapter_selection_prompt},
             {
                 "role": "user",
-                "content": f'以下是论文大纲（XML）。请只输出最重要的大章节 section_id 列表（最多 {max_sections} 个），用 JSON 数组表示，如 ["1", "2", "3"].\n\n{outline_xml}',
+                "content": f'以下是论文大纲（XML）。请只输出最重要的大章节 section_id 列表（最多 {max_sections} 个），跳过封面、诚信承诺等非学术内容，但必须包含目录（非常重要的环节）。从摘要开始选择，用 JSON 数组表示，如 ["5", "7", "8", "9"]（摘要+目录+正文）.\n\n{outline_xml}',
             },
         ]
         try:
@@ -200,19 +204,110 @@ class DocAgent:
             raw = response.choices[0].message.content
             data = self._parse_json(raw)
             if isinstance(data, list):
-                return [str(x) for x in data][:max_sections]
-            if isinstance(data, dict) and "sections" in data:
-                return [str(x) for x in data.get("sections", [])][:max_sections]
+                selected_sections = [str(x) for x in data][:max_sections]
+            elif isinstance(data, dict) and "sections" in data:
+                selected_sections = [str(x) for x in data.get("sections", [])][:max_sections]
+            else:
+                selected_sections = []
+
+            # 如果启用了跳过前置内容，则过滤掉前面的非学术部分，但确保包含重要章节
+            if skip_front_matter and selected_sections:
+                # 首先找到目录章节（通常包含"目 录"或"目录"）
+                toc_section = None
+                for child in self.doc_reader.root:
+                    if child.tag == "Section":
+                        section_id = child.get("section_id")
+                        try:
+                            sec_root = self.doc_reader.get_section_content(section_id)
+                            title_text = f"Section {section_id}"
+                            for node in sec_root:
+                                if node.tag in ["Heading", "Title"] and node.text:
+                                    title_text = node.text
+                                    break
+                            if any(keyword in title_text for keyword in ["目 录", "目录"]):
+                                toc_section = section_id
+                                break
+                        except Exception:
+                            continue
+
+                # 过滤掉典型的非学术章节（根据标题特征）
+                filtered_sections = []
+                for sid in selected_sections:
+                    try:
+                        sec_root = self.doc_reader.get_section_content(sid)
+                        title_text = f"Section {sid}"
+                        for node in sec_root:
+                            if node.tag in ["Heading", "Title"] and node.text:
+                                title_text = node.text
+                                break
+
+                        # 跳过封面、诚信承诺等非学术内容，但保留摘要、目录等重要内容
+                        skip_keywords = ["封面", "诚信", "承诺", "签名", "杭州電子科技大学"]
+                        keep_keywords = ["目 录", "目录", "摘要", "abstract", "摘 要"]
+                        if not any(keyword in title_text for keyword in skip_keywords) or any(keyword in title_text for keyword in keep_keywords):
+                            filtered_sections.append(sid)
+                    except Exception:
+                        continue
+
+                # 确保目录被包含（如果找到了目录章节）
+                if toc_section and toc_section not in filtered_sections:
+                    filtered_sections.insert(0, toc_section)  # 插入到开头
+
+                return filtered_sections[:max_sections]
+
+            return selected_sections
+
         except Exception as e:
             print(f"[SectionSelect] failed: {e}")
-        # fallback: take top-level section ids from doc_reader
+
+        # fallback: take top-level section ids from doc_reader, skip front matter but keep important sections
         top_ids = []
+        toc_section = None
+
+        # 首先找到目录章节
         for child in self.doc_reader.root:
             if child.tag == "Section":
-                top_ids.append(child.get("section_id"))
+                section_id = child.get("section_id")
+                try:
+                    title_text = f"Section {section_id}"
+                    for node in child:
+                        if node.tag in ["Heading", "Title"] and node.text:
+                            title_text = node.text
+                            break
+                    if any(keyword in title_text for keyword in ["目 录", "目录"]):
+                        toc_section = section_id
+                        break
+                except Exception:
+                    continue
+
+        for child in self.doc_reader.root:
+            if child.tag == "Section":
+                section_id = child.get("section_id")
+                if skip_front_matter:
+                    # 基于section_id和内容跳过前面的非学术部分，但保留摘要和目录
+                    try:
+                        sid_int = int(section_id)
+                        if sid_int <= 4:  # 跳过前4个section（封面相关）
+                            # 但要检查是否是摘要、目录等重要内容
+                            title_text = f"Section {section_id}"
+                            for node in child:
+                                if node.tag in ["Heading", "Title"] and node.text:
+                                    title_text = node.text
+                                    break
+                            keep_keywords = ["目 录", "目录", "摘要", "abstract", "摘 要"]
+                            if not any(keyword in title_text for keyword in keep_keywords):
+                                continue
+                    except (ValueError, TypeError):
+                        pass
+                top_ids.append(section_id)
             if len(top_ids) >= max_sections:
                 break
-        return top_ids
+
+        # 确保目录被包含在结果中
+        if toc_section and toc_section not in top_ids:
+            top_ids.insert(0, toc_section)  # 插入到开头
+
+        return top_ids[:max_sections]
 
     def _needs_vision_verification(self, issue):
         """Determine if an issue needs vision verification (e.g. missing sections, page numbers)."""
@@ -662,9 +757,9 @@ class DocAgent:
         self.fact_store = {"entities": {}, "numbers": {}, "dates": {}, "claims": []}
         print("[Fact Store] Initialized for cross-chapter conflict detection")
 
-        # Step 0: Let LLM select top/important sections
-        top_sections = self.select_top_sections(max_sections=8)
-        print(f"[Logic] Selected sections: {top_sections}")
+        # Step 0: Let LLM select top/important sections (skip front matter)
+        top_sections = self.select_top_sections(max_sections=8, skip_front_matter=True)
+        print(f"[Logic] Selected sections (skipping front matter): {top_sections}")
 
         # Build chapters list from selected section_ids (fallback to top-level if empty)
         chapters = []

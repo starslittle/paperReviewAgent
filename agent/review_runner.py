@@ -92,7 +92,7 @@ def main():
             continue
 
         print(f"[Review] {doc_id}")
-        reader = doc_reader.DocReader(data_path=data_path)
+        reader = DocReader(data_path=data_path)
         agent = doc_agent.DocAgent(
             reader,
             model_id="deepseek-chat",

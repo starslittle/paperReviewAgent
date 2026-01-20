@@ -1,6 +1,6 @@
 """
-MinerU middle.json 处理脚本
-充分利用字体大小、坐标、层级等元数据进行格式一致性分析
+改进版 MinerU middle.json 处理脚本
+修复标题识别问题:正确使用 text_level 字段
 """
 
 import argparse
@@ -10,53 +10,60 @@ import shutil
 from typing import Dict, List
 import pandas as pd
 from dotenv import load_dotenv
+import re
 
 # 加载环境变量
 load_dotenv(override=True, encoding="utf-8")
 
 
-class MiddleJsonProcessor:
+class ImprovedJsonProcessor:
     """
-    MinerU middle.json 处理器
-    暴露字体大小、坐标、层级等元数据用于格式一致性分析
+    改进的 MinerU 处理器,正确识别标题层级
     """
 
     def __init__(self):
-        self.font_size_threshold = {}  # 字体大小阈值（用于层级判定）
+        self.heading_pattern = re.compile(r'^(\d+\.|\d+\.\d+\.|第.+章)')
 
     def process(self, root_path):
         """
-        处理 MinerU 产物，生成带元数据的 DataFrame
+        处理 MinerU 产物,生成带正确标题层级的 DataFrame
         """
-        # 优先级：middle.json > *_content_list.json > layout.json
-        middle_json_path = os.path.join(root_path, "middle.json")
-        
-        if not os.path.exists(middle_json_path):
-            # 尝试寻找 content_list.json
-            content_lists = [f for f in os.listdir(root_path) if f.endswith("_content_list.json")]
-            if content_lists:
-                middle_json_path = os.path.join(root_path, content_lists[0])
-            else:
-                # 尝试寻找 layout.json
-                layout_path = os.path.join(root_path, "layout.json")
-                if os.path.exists(layout_path):
-                    middle_json_path = layout_path
+        # 优先级：content_list.json > middle.json > layout.json
+        content_list_path = None
+        middle_json_path = None
 
-        if not os.path.exists(middle_json_path):
-            print(f"[Error] 在 {root_path} 中未找到任何可用的解析 JSON (middle/content_list/layout)")
+        # 查找 content_list.json
+        for f in os.listdir(root_path):
+            if f.endswith("_content_list.json"):
+                content_list_path = os.path.join(root_path, f)
+                break
+
+        # 查找 middle.json
+        middle_json_path = os.path.join(root_path, "middle.json")
+        layout_json_path = os.path.join(root_path, "layout.json")
+
+        # 确定使用的文件
+        if content_list_path and os.path.exists(content_list_path):
+            json_path = content_list_path
+            print(f"[Info] Using content_list.json: {os.path.basename(json_path)}")
+        elif middle_json_path and os.path.exists(middle_json_path):
+            json_path = middle_json_path
+            print(f"[Info] Using middle.json")
+        elif layout_json_path and os.path.exists(layout_json_path):
+            json_path = layout_json_path
+            print(f"[Info] Using layout.json")
+        else:
+            print(f"[Error] 未找到任何可用的解析 JSON")
             return None
 
-        print(f"[Info] 正在使用解析文件: {os.path.basename(middle_json_path)}")
-
         try:
-            with open(middle_json_path, "r", encoding="utf-8") as f:
+            with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
             print(f"[Error] 读取 JSON 失败: {e}")
             return None
 
         # 解析元素列表
-        # MinerU 的数据可能直接是列表，也可能在 pdf_info 键下
         if isinstance(data, list):
             raw_elements = data
         elif isinstance(data, dict):
@@ -64,14 +71,13 @@ class MiddleJsonProcessor:
         else:
             raw_elements = []
 
-        # 进一步处理 layout.json 这种按页组织的结构
+        # 处理 layout.json 按页组织的情况
         elements = []
         for item in raw_elements:
             if isinstance(item, dict) and "preproc_blocks" in item:
-                # 这是一个页面对象，展开其中的 blocks
                 page_idx = item.get("page_idx", 0)
                 for block in item["preproc_blocks"]:
-                    block["page_idx"] = page_idx # 确保 block 带有页码
+                    block["page_idx"] = page_idx
                     elements.append(block)
             else:
                 elements.append(item)
@@ -80,10 +86,7 @@ class MiddleJsonProcessor:
             print(f"[Warning] JSON 中未找到有效数据")
             return None
 
-        # 第一轮遍历：统计字体大小分布（用于自适应层级判定）
-        self._analyze_font_sizes(elements)
-
-        # 第二轮遍历：构建 DataFrame
+        # 构建 DataFrame
         records = []
         curr_page = -1
         image_count, table_count = 1, 1
@@ -93,51 +96,50 @@ class MiddleJsonProcessor:
             page_idx = element.get("page_idx", 0)
             if page_idx > curr_page:
                 curr_page = page_idx
-                records.append(
-                    {
-                        "para_text": None,
-                        "style": "Page_Start",
-                        "table_id": str(page_idx + 1),  # 页码从1开始
-                        "font_size": None,
-                        "font_family": None,
-                        "bbox": None,
-                        "page_idx": page_idx,
-                    }
-                )
+                records.append({
+                    "para_text": None,
+                    "style": "Page_Start",
+                    "table_id": str(page_idx + 1),
+                    "font_size": None,
+                    "font_family": None,
+                    "bbox": None,
+                    "page_idx": page_idx,
+                })
 
             etype = element.get("type", "").lower()
-            # 兼容不同格式的文本字段名 (content 或 text)
             content = (element.get("content") or element.get("text") or "").strip()
             font_size = element.get("font_size")
             font_family = element.get("font_family", "")
             bbox = element.get("bbox", [])
 
+            # 🔥 关键改进:使用 text_level 字段
+            text_level = element.get("text_level", 0)
+
             # 过滤无效内容
             if not content and etype not in ["image", "figure", "table"]:
                 continue
 
-            # 根据类型和元数据判定样式
-            style, item_id = self._determine_style(
-                etype, content, font_size, element, image_count, table_count
+            # 判定样式
+            style, item_id = self._determine_style_improved(
+                etype, content, font_size, text_level, element, image_count, table_count
             )
 
             # 更新计数器
             if style == "Image":
                 image_count += 1
+                content = item_id
             elif style == "Table":
                 table_count += 1
 
-            records.append(
-                {
-                    "para_text": content,
-                    "style": style,
-                    "table_id": item_id,
-                    "font_size": font_size,
-                    "font_family": font_family,
-                    "bbox": bbox,
-                    "page_idx": page_idx,
-                }
-            )
+            records.append({
+                "para_text": content,
+                "style": style,
+                "table_id": item_id if style != "Image" else None,
+                "font_size": font_size,
+                "font_family": font_family,
+                "bbox": bbox,
+                "page_idx": page_idx,
+            })
 
         if not records:
             print(f"[Warning] 未提取到有效内容")
@@ -150,62 +152,24 @@ class MiddleJsonProcessor:
 
         return df
 
-    def _analyze_font_sizes(self, elements):
-        """
-        分析字体大小分布，用于自适应层级判定
-        """
-        font_sizes = []
-        for elem in elements:
-            if elem.get("type", "").lower() in ["title", "heading", "text"]:
-                fs = elem.get("font_size")
-                if fs:
-                    font_sizes.append(fs)
-
-        if not font_sizes:
-            return
-
-        # 计算字体大小的四分位数
-        sorted_sizes = sorted(set(font_sizes), reverse=True)
-        if len(sorted_sizes) >= 3:
-            self.font_size_threshold = {
-                "heading1": sorted_sizes[0],
-                "heading2": (
-                    sorted_sizes[1] if len(sorted_sizes) > 1 else sorted_sizes[0]
-                ),
-                "heading3": (
-                    sorted_sizes[2] if len(sorted_sizes) > 2 else sorted_sizes[1]
-                ),
-                "normal": sorted_sizes[-1],
-            }
-            print(f"[Info] 自适应字体阈值: {self.font_size_threshold}")
-
-    def _determine_style(
-        self, etype, content, font_size, element, image_count, table_count
+    def _determine_style_improved(
+        self, etype, content, font_size, text_level, element, image_count, table_count
     ):
         """
-        根据类型、内容和字体大小综合判定样式
+        改进的样式判定逻辑,正确使用 text_level
 
-        Returns:
-            (style, item_id)
+        Args:
+            text_level: MinerU 提供的标题层级 (0=普通, 1=一级标题, 2=二级标题...)
         """
-        # 1. 标题类型
-        if etype in ["title", "heading"]:
-            # 兼容 level 或 text_level
-            level = element.get("level") or element.get("text_level")
-            
-            # 如果是 1 且内容太长，可能是误判（常见于 content_list）
-            if level == 1 and len(content) > 100:
-                return "Normal", None
+        # 🔥 优先使用 text_level 字段判断标题
+        if text_level and text_level > 0:
+            # text_level > 0 就是标题,不再过滤长文本
+            # MinerU 已经正确识别了标题
+            return f"Heading {text_level}", None
 
-            # 如果仍然没有层级，通过字体大小推断
-            if not level and font_size and self.font_size_threshold:
-                if font_size >= self.font_size_threshold.get("heading1", 20):
-                    level = 1
-                elif font_size >= self.font_size_threshold.get("heading2", 16):
-                    level = 2
-                else:
-                    level = 3
-
+        # 兼容其他类型的标题标记
+        level = element.get("level") or element.get("text_level")
+        if level and level > 0:
             return f"Heading {level}", None
 
         # 2. 图表说明
@@ -215,12 +179,14 @@ class MiddleJsonProcessor:
         # 3. 图片
         if etype in ["image", "figure"]:
             img_path = element.get("img_path", f"image_{image_count}.png")
-            return "Image", image_count
+            image_data = {
+                "path": img_path,
+                "alt_text": element.get("image_caption", [""])[0] if element.get("image_caption") else None
+            }
+            return "Image", image_data
 
         # 4. 表格
         if etype == "table":
-            # MinerU 的表格内容通常是 Markdown 格式
-            table_data = {"content": content}
             return "Table", table_count
 
         # 5. 脚注
@@ -243,35 +209,43 @@ class MiddleJsonProcessor:
 
     def _print_statistics(self, df):
         """打印 DataFrame 统计信息"""
-        print(f"\n[📊] 处理统计:")
-        print(f"    总行数: {len(df)}")
-        print(f"    样式分布:")
+        print(f"\n[Statistics] Processing results:")
+        print(f"    Total rows: {len(df)}")
+        print(f"    Style distribution:")
         for style, count in df["style"].value_counts().items():
             print(f"        - {style}: {count}")
 
-        # 字体大小统计（仅对有字体的行）
+        # 检查是否识别到标题
+        has_heading = df["style"].str.startswith("Heading", na=False).any()
+        if has_heading:
+            heading_count = df[df["style"].str.startswith("Heading", na=False)].shape[0]
+            print(f"\n    [SUCCESS] Identified {heading_count} headings!")
+        else:
+            print(f"\n    [WARNING] No headings found")
+
+        # 字体大小统计
         font_df = df[df["font_size"].notna()]
         if not font_df.empty:
-            print(
-                f"    字体大小范围: {font_df['font_size'].min():.1f} - {font_df['font_size'].max():.1f}"
-            )
+            print(f"    Font size range: {font_df['font_size'].min():.1f} - {font_df['font_size'].max():.1f}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="处理 MinerU middle.json 并生成标准 DataFrame"
+        description="改进版:处理 MinerU JSON 并生成带正确标题的 DataFrame"
     )
     parser.add_argument(
-        "--extract-data-dir", default="preprocess/extract_output/MinerU", help="MinerU 输出目录"
+        "--extract-data-dir", default="preprocess/extract_output/MinerU",
+        help="MinerU 输出目录"
     )
     parser.add_argument(
-        "--save-dir", default="preprocess/processed_output/MinerU", help="最终处理结果目录"
+        "--save-dir", default="preprocess/processed_output/MinerU",
+        help="最终处理结果目录"
     )
     parser.add_argument("--doc-id", type=str, default=None, help="指定要处理的文档ID")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
-    processor = MiddleJsonProcessor()
+    processor = ImprovedJsonProcessor()
 
     # 遍历 MinerU 提取后的目录
     for sid in os.listdir(args.extract_data_dir):
@@ -294,33 +268,26 @@ def main():
         save_path = os.path.join(args.save_dir, sid)
         os.makedirs(save_path, exist_ok=True)
 
-        # 保存 DataFrame (标准格式供 Agent 调用)
-        df.to_pickle(os.path.join(save_path, "data.pkl"))
+        # 备份旧文件
+        old_pkl = os.path.join(save_path, "data.pkl")
+        if os.path.exists(old_pkl):
+            import shutil
+            shutil.copy(old_pkl, old_pkl + ".backup")
+            print(f"[Backup] Old file backed up to data.pkl.backup")
 
-        # 同时保存 CSV 方便调试
+        # 保存新的 DataFrame
+        df.to_pickle(old_pkl)
+
+        # 保存 CSV 方便调试
         df.to_csv(
             os.path.join(save_path, "data.csv"), index=False, encoding="utf-8-sig"
         )
 
-        # 拷贝原始 middle.json (供高级分析使用)
-        src_middle = os.path.join(root_path, "middle.json")
-        if os.path.exists(src_middle):
-            shutil.copy(src_middle, os.path.join(save_path, "middle.json"))
+        print(f"[OK] {sid} processed -> {save_path}/")
+        print(f"    - data.pkl (updated with correct headings)")
+        print(f"    - data.csv (for debugging)")
 
-        # 拷贝图片和表格文件夹
-        for folder in ["images", "tables", "figures"]:
-            src = os.path.join(root_path, folder)
-            if os.path.exists(src):
-                shutil.copytree(
-                    src, os.path.join(save_path, folder), dirs_exist_ok=True
-                )
-
-        print(f"[✓] {sid} 处理完成 -> {save_path}/")
-        print(f"    - data.pkl (标准格式)")
-        print(f"    - data.csv (调试查看)")
-        print(f"    - middle.json (完整元数据)")
-
-    print(f"\n[✓] 全部处理完成")
+    print(f"\n[OK] All processing completed")
 
 
 if __name__ == "__main__":
