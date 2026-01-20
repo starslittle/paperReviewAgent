@@ -29,9 +29,9 @@ DEEPSEEK_API_KEY=your_deepseek_api_key
 Prerequisite: Obtain free Adobe PDF Service Client ID and Secret from [here](https://acrobatservices.adobe.com/dc-integration-creation-app-cdn/main.html?api=pdf-services-api).
 ```bash
 cd preprocess
-python 1_run_pdf_extract.py --raw-data-dir ../sample_data/ --result-dir ./extract_output/
+python 1_run_pdf_extract.py --raw-data-dir ../data/ --result-dir ./extract_output/
 python 2_process_extracted_data.py --extract-data-dir ./extract_output/ --save-dir ./processed_output/
-python 3_make_page_images.py --raw-data-dir ../sample_data/ --save-dir ./processed_output/
+python 3_make_page_images.py --raw-data-dir ../data/ --save-dir ./processed_output/
 ```
 
 ### Run DocAgent

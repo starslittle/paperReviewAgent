@@ -30,13 +30,13 @@ parser.add_argument(
 parser.add_argument(
     "--preprocessed-data-dir",
     type=str,
-    default="./preprocess/processed_output/",
+    default="./preprocess/processed_output/MinerU/",
     help="Preprocessed data directory",
 )
 parser.add_argument(
     "--raw-data-dir",
     type=str,
-    default="./sample_data/",
+    default="./data/",
     help="Raw data directory",
 )
 args = parser.parse_args()

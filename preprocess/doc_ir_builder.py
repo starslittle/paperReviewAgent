@@ -7,7 +7,10 @@ import xml.etree.ElementTree as ET
 
 import pandas as pd
 
-from .doc_ir import DocIR, DocIRMeta, FigureNode, SectionNode, TableNode, TextBlock
+try:
+    from .doc_ir import DocIR, DocIRMeta, FigureNode, SectionNode, TableNode, TextBlock
+except ImportError:
+    from doc_ir import DocIR, DocIRMeta, FigureNode, SectionNode, TableNode, TextBlock
 
 
 @dataclass

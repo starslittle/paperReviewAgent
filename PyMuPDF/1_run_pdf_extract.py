@@ -67,7 +67,7 @@ def parse_arguments():
     )
     parser.add_argument(
         "--raw-data-dir",
-        default="../sample_data/",
+        default="../data/",
         help="Directory containing raw PDF files",
     )
     parser.add_argument(

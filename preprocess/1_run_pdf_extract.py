@@ -70,8 +70,8 @@ class MinerUExtractor:
         Returns:
             bool: 是否成功
         """
-        # 输出目录：./extract_output/{sid}/MinerU/
-        output_dir = os.path.join(result_dir, sid, "MinerU")
+        # 输出目录：preprocess/extract_output/MinerU/{sid}/
+        output_dir = os.path.join(result_dir, "MinerU", sid)
         os.makedirs(output_dir, exist_ok=True)
 
         # 检查本地是否已有结果
@@ -276,10 +276,10 @@ class MinerUExtractor:
 def main():
     parser = argparse.ArgumentParser(description="MinerU PDF 提取脚本")
     parser.add_argument(
-        "--raw-data-dir", default="../sample_data/", help="原始数据目录"
+        "--raw-data-dir", default="../data/", help="原始数据目录"
     )
     parser.add_argument(
-        "--result-dir", default="./extract_output/", help="输出结果目录"
+        "--result-dir", default="preprocess/extract_output", help="输出结果目录"
     )
     parser.add_argument("--doc-id", type=str, default=None, help="指定处理的文档 ID")
     args = parser.parse_args()

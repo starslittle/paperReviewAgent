@@ -4,7 +4,7 @@
 param(
     [string]$ExtractDataDir = "./extract_output/",
     [string]$SaveDir = "./processed_output/",
-    [string]$RawDataDir = "../sample_data/",
+    [string]$RawDataDir = "../data/",
     [int]$OcrMaxPages = 50,
     [switch]$UseGpu,
     [string]$DocId = ""

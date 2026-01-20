@@ -45,7 +45,7 @@ cd preprocess
 ### 步骤 1：Adobe PDF 结构化提取
 将原始 PDF 转换为中间 XML 格式：
 ```bash
-python 1_run_pdf_extract.py --raw-data-dir ../sample_data/ --result-dir ./extract_output/
+python 1_run_pdf_extract.py --raw-data-dir ../data/ --result-dir ./extract_output/
 ```
 
 ### 步骤 2：标题增强与修正 (OCR 或 Vision)
@@ -70,7 +70,7 @@ python 2_process_extracted_data.py --use-vision --doc-id bylw --ocr-max-pages 10
 ### 步骤 3：生成页面图像
 为视觉审查代理（Vision Agent）准备图像数据：
 ```bash
-python 3_make_page_images.py --raw-data-dir ../sample_data/ --save-dir ./processed_output/
+python 3_make_page_images.py --raw-data-dir ../data/ --save-dir ./processed_output/
 ```
 
 ---

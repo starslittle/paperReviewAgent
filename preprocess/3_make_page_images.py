@@ -9,13 +9,13 @@ parser = argparse.ArgumentParser(description="Process extracted data")
 parser.add_argument(
     "--raw-data-dir",
     type=str,
-    default="../sample_data/",
+    default="../data/",
     help="Directory to save results",
 )
 parser.add_argument(
     "--save-dir",
     type=str,
-    default="./processed_output/",
+    default="preprocess/processed_output/MinerU",
     help="Directory to save results",
 )
 parser.add_argument(
@@ -33,17 +33,17 @@ def process_one(pdf_path: str, save_root: str):
     os.makedirs(save_root, exist_ok=True)
     os.makedirs(os.path.join(save_root, "page_images"), exist_ok=True)
 
-        with fitz.open(pdf_path) as pdf:
-            for index, page in enumerate(pdf):
-                image = page.get_pixmap(dpi=args.resolution)
-                index_string = "%04d" % index
-                image.save(
-                    os.path.join(
+    with fitz.open(pdf_path) as pdf:
+        for index, page in enumerate(pdf):
+            image = page.get_pixmap(dpi=args.resolution)
+            index_string = "%04d" % index
+            image.save(
+                os.path.join(
                     save_root,
-                        "page_images",
-                        f"page_{index_string}.png",
-                    )
+                    "page_images",
+                    f"page_{index_string}.png",
                 )
+            )
 
 
 def main(args):

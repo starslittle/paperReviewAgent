@@ -283,7 +283,7 @@ class MinerUExtractor:
 def main():
     parser = argparse.ArgumentParser(description="MinerU PDF 提取脚本")
     parser.add_argument(
-        "--raw-data-dir", default="../sample_data/", help="原始数据目录"
+        "--raw-data-dir", default="../data/", help="原始数据目录"
     )
     parser.add_argument(
         "--result-dir", default="./extract_output/", help="输出结果目录"

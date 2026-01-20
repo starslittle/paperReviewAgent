@@ -48,7 +48,7 @@ sample_results/
 !prompts.py
 !README.md
 !LICENSE
-!sample_data/**
+!data/**
 !sample_results/job_00000.json
 !sample_results/job_000001.json
 

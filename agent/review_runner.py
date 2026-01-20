@@ -11,8 +11,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from agent import doc_agent
-from agent import doc_reader
+from . import doc_agent
+from preprocess.doc_reader import DocReader
 
 
 def parse_args():
@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument(
         "--preprocessed-data-dir",
         type=str,
-        default="./preprocess/processed_output/MinerU/",
+        default="./preprocess/processed_output/",
         help="Directory containing processed documents (each doc in a subfolder)",
     )
     parser.add_argument(

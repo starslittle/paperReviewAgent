@@ -36,7 +36,7 @@ parser.add_argument(
 parser.add_argument(
     "--raw-data-dir",
     type=str,
-    default="../sample_data/",
+    default="../data/",
     help="Raw PDF data directory (for OCR enhancement)",
 )
 parser.add_argument(

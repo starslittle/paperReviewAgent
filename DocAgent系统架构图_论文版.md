@@ -158,7 +158,7 @@ DocAgent 是一个面向**超长文档多模态理解**的多智能体协作框�
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │                        输入: Raw PDF                            │
-│                       (sample_data/)                           │
+│                       (data/)                           │
 └───────────────────────────┬────────────────────────────────────┘
                             │
         ┌───────────────────▼────────────────────┐
@@ -1058,14 +1058,14 @@ cd preprocess
 
 # Step 1: Adobe PDF 提取
 python 1_run_pdf_extract.py \
-    --raw-data-dir ../sample_data/ \
+    --raw-data-dir ../data/ \
     --result-dir ./extract_output/
 
 # Step 2: OCR 增强（可选，推荐）
 python 2_process_extracted_data.py \
     --extract-data-dir ./extract_output/ \
     --save-dir ./processed_output/ \
-    --raw-data-dir ../sample_data/ \
+    --raw-data-dir ../data/ \
     --use-ocr \
     --ocr-max-pages 50
 
@@ -1074,7 +1074,7 @@ python 2_process_extracted_data.py \
 
 # Step 3: 页面图像化
 python 3_make_page_images.py \
-    --raw-data-dir ../sample_data/ \
+    --raw-data-dir ../data/ \
     --save-dir ./processed_output/
 
 # ===== Phase 2: DocAgent 审查 =====
@@ -1172,7 +1172,7 @@ DocAgent-main/
 ├── prompts.py               # Prompt 模板
 ├── review_runner.py         # 审查执行器
 ├── generate_report.py       # 报告生成
-├── sample_data/             # 示例数据
+├── data/             # 示例数据
 └── sample_results/          # 输出结果
 ```
 

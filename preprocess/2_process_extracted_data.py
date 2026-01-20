@@ -27,36 +27,57 @@ class MiddleJsonProcessor:
     def process(self, root_path):
         """
         处理 MinerU 产物，生成带元数据的 DataFrame
-
-        Args:
-            root_path: MinerU 输出目录 (包含 middle.json)
-
-        Returns:
-            DataFrame 包含以下列：
-            - para_text: 文本内容
-            - style: 样式 (Heading 1/2/3, Normal, Caption, Table, Image)
-            - table_id: 表格/图片编号或页码
-            - font_size: 字体大小 (用于一致性检查)
-            - font_family: 字体族
-            - bbox: 边界框坐标 [x0, y0, x1, y1]
-            - page_idx: 页码
         """
+        # 优先级：middle.json > *_content_list.json > layout.json
         middle_json_path = os.path.join(root_path, "middle.json")
+        
         if not os.path.exists(middle_json_path):
-            print(f"[Error] 在 {root_path} 中未找到 middle.json")
+            # 尝试寻找 content_list.json
+            content_lists = [f for f in os.listdir(root_path) if f.endswith("_content_list.json")]
+            if content_lists:
+                middle_json_path = os.path.join(root_path, content_lists[0])
+            else:
+                # 尝试寻找 layout.json
+                layout_path = os.path.join(root_path, "layout.json")
+                if os.path.exists(layout_path):
+                    middle_json_path = layout_path
+
+        if not os.path.exists(middle_json_path):
+            print(f"[Error] 在 {root_path} 中未找到任何可用的解析 JSON (middle/content_list/layout)")
             return None
+
+        print(f"[Info] 正在使用解析文件: {os.path.basename(middle_json_path)}")
 
         try:
             with open(middle_json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
-            print(f"[Error] 读取 middle.json 失败: {e}")
+            print(f"[Error] 读取 JSON 失败: {e}")
             return None
 
         # 解析元素列表
-        elements = data.get("pdf_info", [])
+        # MinerU 的数据可能直接是列表，也可能在 pdf_info 键下
+        if isinstance(data, list):
+            raw_elements = data
+        elif isinstance(data, dict):
+            raw_elements = data.get("pdf_info", [])
+        else:
+            raw_elements = []
+
+        # 进一步处理 layout.json 这种按页组织的结构
+        elements = []
+        for item in raw_elements:
+            if isinstance(item, dict) and "preproc_blocks" in item:
+                # 这是一个页面对象，展开其中的 blocks
+                page_idx = item.get("page_idx", 0)
+                for block in item["preproc_blocks"]:
+                    block["page_idx"] = page_idx # 确保 block 带有页码
+                    elements.append(block)
+            else:
+                elements.append(item)
+
         if not elements:
-            print(f"[Warning] middle.json 中未找到 pdf_info 数据")
+            print(f"[Warning] JSON 中未找到有效数据")
             return None
 
         # 第一轮遍历：统计字体大小分布（用于自适应层级判定）
@@ -85,7 +106,8 @@ class MiddleJsonProcessor:
                 )
 
             etype = element.get("type", "").lower()
-            content = element.get("content", "").strip()
+            # 兼容不同格式的文本字段名 (content 或 text)
+            content = (element.get("content") or element.get("text") or "").strip()
             font_size = element.get("font_size")
             font_family = element.get("font_family", "")
             bbox = element.get("bbox", [])
@@ -168,9 +190,14 @@ class MiddleJsonProcessor:
         """
         # 1. 标题类型
         if etype in ["title", "heading"]:
-            level = element.get("level", 1)
+            # 兼容 level 或 text_level
+            level = element.get("level") or element.get("text_level")
+            
+            # 如果是 1 且内容太长，可能是误判（常见于 content_list）
+            if level == 1 and len(content) > 100:
+                return "Normal", None
 
-            # 如果 MinerU 没有提供层级，通过字体大小推断
+            # 如果仍然没有层级，通过字体大小推断
             if not level and font_size and self.font_size_threshold:
                 if font_size >= self.font_size_threshold.get("heading1", 20):
                     level = 1
@@ -235,10 +262,10 @@ def main():
         description="处理 MinerU middle.json 并生成标准 DataFrame"
     )
     parser.add_argument(
-        "--extract-data-dir", default="./extract_output/", help="MinerU 输出目录"
+        "--extract-data-dir", default="preprocess/extract_output/MinerU", help="MinerU 输出目录"
     )
     parser.add_argument(
-        "--save-dir", default="./processed_output/", help="最终处理结果目录"
+        "--save-dir", default="preprocess/processed_output/MinerU", help="最终处理结果目录"
     )
     parser.add_argument("--doc-id", type=str, default=None, help="指定要处理的文档ID")
     args = parser.parse_args()
