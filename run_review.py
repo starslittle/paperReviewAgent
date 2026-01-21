@@ -76,19 +76,85 @@ def main():
 
     print(f"\n[5/5] Saving results...")
 
-    # 解析结果
-    def _parse_res(res):
+    # 解析结果 - 使用 agent 的解析方法
+    def _parse_json_response(raw_content):
+        """Helper to safely extract and parse JSON from LLM response."""
         import json
         import re
-        raw = res.get("raw", "")
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1:
-            return json.loads(raw[start:end+1])
-        return {"issues": []}
 
-    norm_data = _parse_res(norm_res)
-    logic_data = _parse_res(logic_res)
+        if not raw_content:
+            return {"issues": []}
+
+        # 提取 <json> 标签内容
+        json_block = re.search(r"<json>(.*?)</json>", raw_content, re.DOTALL)
+        if json_block:
+            raw_content = json_block.group(1).strip()
+
+        # 移除 <thinking> 标签
+        cleaned = re.sub(
+            r"<thinking>.*?</thinking>", "", raw_content, flags=re.DOTALL
+        ).strip()
+
+        # 移除 markdown 代码块标记
+        cleaned = re.sub(
+            r"^```(?:json)?|```$", "", cleaned, flags=re.MULTILINE
+        ).strip()
+
+        if not cleaned:
+            return {"issues": []}
+
+        # 尝试修复截断的JSON
+        if cleaned and cleaned[-1] not in '}]]':
+            print(f"[Warning] JSON appears to be truncated, attempting to fix...")
+            if cleaned.count('"') % 2 != 0:
+                cleaned += '"'
+            open_braces = cleaned.count('{') - cleaned.count('}')
+            open_brackets = cleaned.count('[') - cleaned.count(']')
+            for _ in range(open_brackets):
+                cleaned += ']'
+            for _ in range(open_braces):
+                cleaned += '}'
+            print(f"[Fix] Attempted to close {open_brackets} brackets and {open_braces} braces")
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            print(f"[Error] JSON parse failed: {e}")
+            print(f"[Error] Raw content preview: {raw_content[:200]}...")
+            # 尝试提取第一个完整的JSON对象
+            try:
+                start = cleaned.find("{")
+                if start == -1:
+                    return {"issues": []}
+                # 找到匹配的闭合括号
+                brace_count = 0
+                in_string = False
+                escape_next = False
+                for i in range(start, len(cleaned)):
+                    char = cleaned[i]
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if char == '\\':
+                        escape_next = True
+                        continue
+                    if char == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if not in_string:
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                json_str = cleaned[start:i+1]
+                                return json.loads(json_str)
+            except:
+                pass
+            return {"issues": []}
+
+    norm_data = _parse_json_response(norm_res.get("raw", ""))
+    logic_data = _parse_json_response(logic_res.get("raw", ""))
 
     # 合并结果
     final_result = {
@@ -103,20 +169,21 @@ def main():
     final_result["issues"].extend(norm_data.get("issues", []))
     final_result["issues"].extend(logic_data.get("issues", []))
 
-    # 添加视觉问题
+    # 添加视觉问题 - 使用改进的解析方法
     for v in vision_res:
         raw = v.get("raw", "")
         if raw:
-            try:
-                import json
-                import re
-                start = raw.find("{")
-                end = raw.rfind("}")
-                if start != -1 and end != -1:
-                    data = json.loads(raw[start:end+1])
-                    final_result["issues"].extend(data.get("issues", []))
-            except:
-                pass
+            data = _parse_json_response(raw)
+            issues = data.get("issues", [])
+
+            # 为每个视觉问题补充 image_id 和 page 信息
+            for issue in issues:
+                if not issue.get("image_id"):
+                    issue["image_id"] = v.get("image_id", "")
+                if not issue.get("page"):
+                    issue["page"] = v.get("page", None)
+
+            final_result["issues"].extend(issues)
 
     # 保存结果
     import json

@@ -1,0 +1,46 @@
+"""
+简单的图文一致性测试
+"""
+import os
+import sys
+
+# 检查环境
+print("Python version:", sys.version)
+print("Current directory:", os.getcwd())
+
+# 检查关键文件
+files_to_check = [
+    "preprocess/processed_output/MinerU/bylw-pgy/data.pkl",
+    "agent/doc_agent.py",
+    "agent/prompts.py"
+]
+
+print("\nChecking files:")
+for file_path in files_to_check:
+    exists = os.path.exists(file_path)
+    print(f"  {file_path}: {'✓' if exists else '✗'}")
+
+# 检查环境变量
+import os
+env_vars = ["DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY"]
+print("\nChecking environment variables:")
+for var in env_vars:
+    value = os.getenv(var)
+    has_value = bool(value)
+    print(f"  {var}: {'✓' if has_value else '✗'} {'(set)' if has_value else '(not set)'}")
+
+# 尝试导入模块
+print("\nTesting imports:")
+try:
+    from agent import doc_agent
+    print("  ✓ doc_agent imported successfully")
+except ImportError as e:
+    print(f"  ✗ doc_agent import failed: {e}")
+
+try:
+    from preprocess.doc_reader import DocReader
+    print("  ✓ DocReader imported successfully")
+except ImportError as e:
+    print(f"  ✗ DocReader import failed: {e}")
+
+print("\nTest completed.")

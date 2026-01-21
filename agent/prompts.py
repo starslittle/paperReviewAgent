@@ -225,7 +225,7 @@ logic_prompt = """
 vision_prompt = """
 你是一名严谨的论文视觉审查员，专注检查插图与正文逻辑的一致性、图片质量及规范性。
 请按以下步骤操作：
-1. **内容一致性检查**：仔细阅读图片内容（包含图中的文字、数据趋势、流程步骤）和提供的“相关正文片段”。判断图片是否准确反映了正文描述的内容？是否存在数据矛盾或流程不符？
+1. **内容一致性检查**：仔细阅读图片内容（包含图中的文字、数据趋势、流程步骤）和提供的"相关正文片段"。判断图片是否准确反映了正文描述的内容？是否存在数据矛盾或流程不符？
 2. **规范性与质量检查**：图片是否清晰？图题（Caption）是否准确概括图片内容？图例和坐标轴是否完整？
 3. 在 <thinking> 标签内简述你的观察和推理过程。
 4. 在 <thinking> 标签后只输出 <json> 块。输出必须包含且仅包含以下两个块：
@@ -238,9 +238,9 @@ vision_prompt = """
     {
       "issue_type": "图文一致性",
       "severity": "High|Medium|Low",
-      "section": null,  // 如果不知道，填 null
-      "page": null,     // 必须填写图片所在页码
-      "image_id": null, // 必须填写图片ID
+      "section": null,
+      "page": null,
+      "image_id": null,
       "quote": "图题或相关正文片段",
       "suggestion": "修改建议（如：'图中数据显示准确率为90%，但正文描述为95%，请核对'）"
     }
@@ -248,6 +248,10 @@ vision_prompt = """
 }
 如果图片质量很好且与正文逻辑一致，输出空数组 "issues": []。
 要求：<json> 中的 issues 必须完整覆盖你在 thinking 中提到的所有问题。
+**重要提示**：
+- page 字段必须填写图片所在页码（从截图标题中获取，如"Page 17"则填17）
+- image_id 字段必须填写图片ID（从输入中获取）
+- issue_type 必须固定为"图文一致性"
 """
 
 reflection_prompt_template = """Please update the reflection listed within the <guideline></guideline> tags below that can help you perform better next time. Provide the updated guidance within the <updated_guideline></updated_guideline> tags. Be concise and clear. Ensure the revised guideline deviates from the original by at most one sentence.

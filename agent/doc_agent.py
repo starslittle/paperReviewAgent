@@ -205,17 +205,53 @@ class DocAgent:
         try:
             if not raw_content:
                 return {"issues": []}
+
+            # 提取 <json> 标签内容
             json_block = re.search(r"<json>(.*?)</json>", raw_content, re.DOTALL)
             if json_block:
                 raw_content = json_block.group(1).strip()
+
+            # 移除 <thinking> 标签
             cleaned = re.sub(
                 r"<thinking>.*?</thinking>", "", raw_content, flags=re.DOTALL
             ).strip()
+
+            # 移除 markdown 代码块标记
             cleaned = re.sub(
                 r"^```(?:json)?|```$", "", cleaned, flags=re.MULTILINE
             ).strip()
+
             if not cleaned:
                 return {"issues": []}
+
+            # 尝试修复截断的JSON
+            # 检查是否被截断（最后一个字符不是 } 或 ]）
+            if cleaned and cleaned[-1] not in '}]':
+                print("[Warning] JSON appears to be truncated, attempting to fix...")
+
+                # 尝试闭合未完成的字符串
+                if cleaned.count('"') % 2 != 0:
+                    # 奇数个引号，说明有未闭合的字符串
+                    cleaned += '"'
+
+                # 尝试闭合数组和对象
+                # 计算需要闭合的括号
+                open_braces = cleaned.count('{') - cleaned.count('}')
+                open_brackets = cleaned.count('[') - cleaned.count(']')
+
+                # 按相反顺序添加闭合括号
+                for _ in range(open_brackets):
+                    cleaned += ']'
+                for _ in range(open_braces):
+                    cleaned += '}'
+
+                print(f"[Fix] Attempted to close {open_brackets} brackets and {open_braces} braces")
+
+            # 移除字符串值中的换行符和特殊字符（改进版）
+            # 使用更强大的方法：先识别 JSON 字符串边界
+            cleaned = self._clean_json_strings(cleaned)
+
+            # 尝试解析
             decoder = json.JSONDecoder()
             for candidate in [cleaned, raw_content]:
                 for idx in range(len(candidate)):
@@ -226,11 +262,52 @@ class DocAgent:
                         return obj
                     except Exception:
                         continue
+
+            # 最后尝试直接解析
             return json.loads(cleaned)
+
         except Exception as e:
             print(f"[Error] JSON parse failed: {str(e)[:200]}")
             print(f"[Error] Raw content preview: {raw_content[:500]}...")
             return {"issues": []}
+
+    def _clean_json_strings(self, json_str):
+        """
+        清理 JSON 字符串中的换行符和特殊字符
+        保留 JSON 结构，只处理字符串值内部的内容
+        """
+        result = []
+        in_string = False
+        escape_next = False
+        current_string = []
+
+        for char in json_str:
+            if escape_next:
+                current_string.append(char)
+                escape_next = False
+                continue
+
+            if char == '\\':
+                current_string.append(char)
+                escape_next = True
+            elif char == '"':
+                current_string.append(char)
+                if in_string:
+                    # 字符串结束
+                    in_string = False
+                else:
+                    # 字符串开始
+                    in_string = True
+            elif char in '\n\r\t' and in_string:
+                # 在字符串内，将换行符和制表符替换为空格
+                current_string.append(' ')
+            elif char == '\n' and not in_string:
+                # 在 JSON 结构中，直接保留（会被 JSON 解析器忽略）
+                current_string.append(char)
+            else:
+                current_string.append(char)
+
+        return ''.join(current_string)
 
     def _find_page_by_quote(self, quote_text, min_len=10):
         """
@@ -1291,7 +1368,7 @@ class DocAgent:
         # 确保包含 <thinking> 标签的要求，以便后续解析
         vision_system_prompt_cn = """
     你是一个专业的学术论文视觉审查助手。你的任务是审查论文中的图片及其上下文。
-    
+
     【核心原则】
     - 只关注"图片是否支持正文/标题的论述"以及"图片是否适合放在该段落中表达观点"。
     - 如果图片内容与小标题、正文段落的观点一致且能支撑论述，则视为"无问题"。
@@ -1304,24 +1381,24 @@ class DocAgent:
     3. 【文档流文本】：参考信息（可能不准确，仅供参考）。
 
     【三步审查流程】
-    
+
     **步骤1：视觉定位（找到图片在哪一页）**
     - 首先查看【目标图片】的视觉特征（形状、内容、颜色等）
     - 然后依次浏览三张页面截图，找到【目标图片】出现在哪一页
     - 记录：图片位于【前一页/当前页/后一页】中的哪一页
-    
+
     **步骤2：依次解析三页内容（按前→中→后顺序）**
     对于每一页，提取以下信息：
     - 是否包含目标图片？
     - 页面上是否有与该图片相关的Caption（如"图 2-5 XXX"）？
     - 页面上是否有与该图号相关的正文描述？
     - 目标图片附近的完整段落（至少一整段），该段落在阐述什么观点？
-    
+
     **重点**：
     - Caption通常紧贴图片下方或上方，是小号黑体字
     - 正文描述可能在图片前后，会引用图号（如"如图2-5所示..."）
     - Caption和正文描述可能跨页（图在前一页末尾，Caption在当前页开头）
-    
+
     **步骤3：综合判断图文一致性与段落匹配性**
     基于你从三页截图中提取的真实信息：
     - Caption的真实内容是什么？（以截图为准，忽略文档流错误）
@@ -1341,24 +1418,43 @@ class DocAgent:
        【步骤1：定位】
        目标图片的视觉特征：...
        在三页中的位置：第X页
-       
+
        【步骤2：依次解析】
        前一页（Page N-1）：...
        当前页（Page N）：看到目标图片，旁边Caption是"图X-X ..."，正文提到...
        后一页（Page N+1）：...
-       
+
        【步骤3：综合判断】
        真实Caption：...
        图片内容：...
        与小标题/正文一致性：...
        与段落观点匹配性：该图是否能准确表达该段观点？是否放置合理？...
        ```
-    
-    2. 然后输出 JSON：{"issues": [...]}
-       - 如果一致，issues为空数组
-       - 如果不一致，提供具体的issue描述
-    
-    3. **请务必使用中文进行回复。**
+
+    2. 在 <thinking> 标签后，输出 <json> 标签包裹的JSON：
+       <json>
+       {
+         "issues": [
+           {
+             "issue_type": "图文一致性",
+             "severity": "High|Medium|Low",
+             "section": "章节名称或null",
+             "page": 图片所在页码（数字，如17）,
+             "image_id": "图片ID或null",
+             "quote": "图题或相关正文片段",
+             "suggestion": "修改建议"
+           }
+         ]
+       }
+       </json>
+
+    3. **重要**：
+       - JSON中不要使用注释（// 或 /* */）
+       - page字段必须是数字，不要写成"Page 17"
+       - 如果没有发现问题，issues为空数组 []
+       - **请务必使用中文进行回复**
+
+    4. **只输出这两个部分**：<thinking>...</thinking> 和 <json>...</json>，不要输出其他任何文本或Markdown标记。
     """
 
         # Determine client to use
@@ -1631,7 +1727,7 @@ class DocAgent:
                 response = client.chat.completions.create(
                     model=vision_model_id,
                     messages=messages,
-                    max_tokens=1000,
+                    max_tokens=4096,  # 进一步增加token限制，确保完整输出
                     temperature=0.0,  # 降低温度确保视觉审查结果稳定
                 )
                 raw_content = response.choices[0].message.content
@@ -1785,7 +1881,7 @@ class DocAgent:
                 response = client.chat.completions.create(
                     model=vision_model_id,
                     messages=messages,
-                    max_tokens=1000,
+                    max_tokens=4096,  # 表格也需要足够的token
                     temperature=0.0,
                 )
                 raw_content = response.choices[0].message.content
