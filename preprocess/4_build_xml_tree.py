@@ -13,6 +13,65 @@ from pathlib import Path
 from doc_ir_builder import DocIRBuilder
 
 
+def _build_outline_from_tree(root: ET.Element) -> ET.Element:
+    outline_root = ET.Element("Outline")
+
+    def _copy_section(src_section: ET.Element, dst_parent: ET.Element) -> None:
+        dst_section = ET.SubElement(dst_parent, "Section", src_section.attrib)
+        for child in list(src_section):
+            if child.tag == "Section":
+                _copy_section(child, dst_section)
+                continue
+
+            if child.tag == "Heading":
+                heading = ET.SubElement(dst_section, "Heading")
+                heading.text = (child.text or "").strip()
+                continue
+
+            if child.tag == "Paragraph":
+                para = ET.SubElement(dst_section, "Paragraph")
+                para.set("page_num", child.get("page_num", ""))
+                para.text = child.text
+                continue
+
+            if child.tag == "Image":
+                image = ET.SubElement(dst_section, "Image", child.attrib)
+                for sub in list(child):
+                    if sub.tag == "Alt_Text":
+                        alt = ET.SubElement(image, "Alt_Text")
+                        alt.text = sub.text
+                continue
+
+            if child.tag == "CSV_Table":
+                table = ET.SubElement(dst_section, "CSV_Table", child.attrib)
+                table.text = child.text
+                for sub in list(child):
+                    if sub.tag == "Alt_Text":
+                        alt = ET.SubElement(table, "Alt_Text")
+                        alt.text = sub.text
+                continue
+
+            if child.tag == "Caption":
+                caption = ET.SubElement(dst_section, "Caption")
+                caption.text = (child.text or "").strip()
+                continue
+
+            if child.tag == "Header":
+                header = ET.SubElement(dst_section, "Header", child.attrib)
+                header.text = (child.text or "").strip()
+                continue
+
+            if child.tag == "Footer":
+                footer = ET.SubElement(dst_section, "Footer", child.attrib)
+                footer.text = (child.text or "").strip()
+                continue
+
+    for section in root.findall("Section"):
+        _copy_section(section, outline_root)
+
+    return outline_root
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="构建 XML 树（DocIR）- 预处理第四步"
@@ -109,12 +168,11 @@ def main():
             tree.write(xml_output_path, encoding="utf-8", xml_declaration=True)
             print(f"[✓] 完整 XML 树已保存 -> {xml_output_path}")
 
-            # 保存大纲视图（简化版）
-            outline_root = result.root
+            # 保存大纲视图（树状简化版）
+            outline_root = _build_outline_from_tree(result.root)
+            ET.indent(outline_root, space="  ")
             outline_tree = ET.ElementTree(outline_root)
-            outline_tree.write(
-                outline_output_path, encoding="utf-8", xml_declaration=True
-            )
+            outline_tree.write(outline_output_path, encoding="utf-8")
             print(f"[✓] 大纲视图已保存 -> {outline_output_path}")
 
             # 打印统计信息

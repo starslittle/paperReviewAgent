@@ -27,18 +27,64 @@ DEEPSEEK_API_KEY=your_deepseek_api_key
 
 ### Data Pre-Processing
 Prerequisite: Obtain free Adobe PDF Service Client ID and Secret from [here](https://acrobatservices.adobe.com/dc-integration-creation-app-cdn/main.html?api=pdf-services-api).
+
+The preprocessing pipeline consists of 4 steps:
 ```bash
 cd preprocess
+
+# Step 1: Adobe PDF Structured Extraction
+# Extract PDF content into intermediate XML format
 python 1_run_pdf_extract.py --raw-data-dir ../data/ --result-dir ./extract_output/
+
+# Step 2: Title Enhancement and Correction (OCR or Vision)
+# Process extracted data and enhance title detection using OCR or Vision models
 python 2_process_extracted_data.py --extract-data-dir ./extract_output/ --save-dir ./processed_output/
+
+# Step 3: Generate Page Images (Optional)
+# Create page images for vision-based agents
 python 3_make_page_images.py --raw-data-dir ../data/ --save-dir ./processed_output/
+
+# Step 4: Build XML Tree Structure
+# Construct hierarchical XML tree from processed data for agent review
+python 4_build_xml_tree.py --processed-dir ./processed_output/ --output-dir ../sample_results/
 ```
 
 ### Run DocAgent
+
+#### Option 1: Run Full Experiment Pipeline
 ```bash
 python ./run_experiment.py --preprocessed-data-dir ./preprocess/processed_output/ \
                            --save-dir ./sample_results/
 ```
+
+#### Option 2: Run Single Document Review
+```bash
+python review_runner.py --doc-id your_doc_id
+```
+
+#### Option 3: Use Automated Pipeline Script (Windows PowerShell)
+```powershell
+.\scripts\run_pipeline.ps1 -DocName your_doc_id
+```
+
+### View Results
+After running DocAgent, results are saved in the `sample_results/` directory:
+- `review_[doc_id].json`: Detailed review results with issues and page numbers
+- `report_[doc_id].html`: Interactive HTML report for visualization
+- `outline_[doc_id].xml`: Extracted document outline structure
+- `tree_[doc_id].xml`: Complete hierarchical XML tree
+
+## Troubleshooting
+
+1. **Adobe API Error**: Ensure Adobe credentials are valid and monthly free quota (1000 pages) hasn't been exceeded.
+2. **OCR Model Download**: First-time OCR usage will download models automatically - ensure stable internet connection.
+3. **Memory Issues**: For large PDFs, limit OCR processing pages using `--ocr-max-pages` parameter.
+4. **Missing Dependencies**: Install optional OCR dependencies if using title correction features:
+   ```bash
+   pip install paddlepaddle paddleocr  # CPU version
+   # or
+   pip install paddlepaddle-gpu paddleocr  # GPU version (recommended)
+   ```
 
 ### Citation
 

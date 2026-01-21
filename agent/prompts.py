@@ -38,7 +38,11 @@ normative_prompt = """
 
 步骤：
 1. 在 <thinking> 标签内简要说明你的检查思路（聚焦格式）。
-2. 在 <thinking> 标签后，只输出 JSON，格式：
+2. 在 <thinking> 后只输出 <json> 块。输出必须包含且仅包含以下两个块：
+   - <thinking>...</thinking>
+   - <json>...</json>
+   除此以外不要输出任何额外文本或 Markdown。
+3. <json> 中的 JSON 格式如下：
 {
   "issues": [
     {
@@ -51,6 +55,7 @@ normative_prompt = """
     }
   ]
 }
+4. 要求：<json> 中的 issues 必须完整覆盖你在 thinking 中提到的所有问题；如无问题，输出 "issues": []。
 
 检查范围（仅格式）：
 - 目录/章节结构是否完整、编号是否连续/对齐。
@@ -110,7 +115,14 @@ local_chapter_review_prompt = """
    - **重点**：如果这是“引言/摘要”章，请提取作者承诺要解决的问题；如果这是“结论”章，请提取作者声称已解决的问题。
 
 请在 <thinking> 标签内进行分析。
-然后输出 JSON（issue_type 必须从以下类型中选择：逻辑性、语言、连贯性）：
+然后仅输出 <json> 块（issue_type 必须从以下类型中选择：逻辑性、语言、连贯性）。
+输出必须包含且仅包含以下两个块：
+1) <thinking>...</thinking>
+2) <json>...</json>
+除此之外不要输出任何额外文本或 Markdown。
+要求：<json> 中的 issues 必须完整覆盖你在 thinking 中提到的所有问题；如无问题，输出 "issues": []。
+
+<json> 中的 JSON 格式如下：
 {
   "chapter_summary": "本章主要介绍了...核心论点是...数据表明...",
   "issues": [
@@ -144,7 +156,14 @@ global_logic_review_prompt = """
    - 各章节之间的逻辑流是否连贯？是否存在断层？
 
 请在 <thinking> 标签内进行深度分析（对比各章摘要）。
-然后输出 JSON：
+然后仅输出 <json> 块。
+输出必须包含且仅包含以下两个块：
+1) <thinking>...</thinking>
+2) <json>...</json>
+除此之外不要输出任何额外文本或 Markdown。
+要求：<json> 中的 issues 必须完整覆盖你在 thinking 中提到的所有问题；如无问题，输出 "issues": []。
+
+<json> 中的 JSON 格式如下：
 {{
   "issues": [
     {{

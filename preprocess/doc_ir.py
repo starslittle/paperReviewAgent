@@ -57,6 +57,7 @@ class TableNode:
     caption: Optional[str] = None
     content: Optional[str] = None
     image_path: Optional[str] = None
+    alt_text: Optional[str] = None
 
 
 @dataclass

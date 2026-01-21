@@ -1,9 +1,11 @@
+import copy
 import json
 import re
 import time
 import traceback
 import xml.dom.minidom
 import xml.etree.ElementTree as ET
+from typing import Optional, Union
 
 from openai import OpenAI
 from pydantic_core.core_schema import nullable_schema
@@ -56,6 +58,102 @@ class DocAgent:
             "dates": {},  # 时间：日期、时间线
             "claims": [],  # 论断：重要观点和结论
         }
+        self._header_footer_index = None
+        self._header_footer_pages = {}
+        self._header_footer_regex = re.compile(
+            r"(第\s*\d+\s*页|页码|学院|专业|指导教师|学校|论文|本科|毕业|\d{4}\s*年)",
+            re.IGNORECASE,
+        )
+
+    def _normalize_header_footer_text(self, text: str) -> str:
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _build_header_footer_index(
+        self, top_bottom_n: int = 2, repeat_threshold: int = 3
+    ):
+        if self._header_footer_index is not None:
+            return
+
+        per_page_texts = {}
+        for elem in self.doc_reader.root.iter():
+            if elem.tag not in ["Paragraph", "Heading", "Title", "Caption"]:
+                continue
+            if not elem.text:
+                continue
+            page_num = elem.get("page_num")
+            if not page_num:
+                continue
+            try:
+                page_int = int(float(page_num))
+            except Exception:
+                continue
+            norm = self._normalize_header_footer_text(elem.text)
+            if not norm:
+                continue
+            per_page_texts.setdefault(page_int, []).append(norm)
+
+        top_bottom_by_page = {}
+        for page, texts in per_page_texts.items():
+            if not texts:
+                continue
+            top = texts[:top_bottom_n]
+            bottom = texts[-top_bottom_n:] if len(texts) > top_bottom_n else texts
+            top_bottom_by_page[page] = set(top + bottom)
+
+        counts = {}
+        for page, texts in per_page_texts.items():
+            for norm in set(texts):
+                counts[norm] = counts.get(norm, 0) + 1
+
+        repeated_texts = {t for t, c in counts.items() if c >= repeat_threshold}
+
+        regex_matches = set()
+        for norm in counts.keys():
+            if self._header_footer_regex.search(norm):
+                regex_matches.add(norm)
+
+        header_footer_texts = set(repeated_texts)
+        header_footer_texts.update(regex_matches)
+
+        self._header_footer_index = header_footer_texts
+        self._header_footer_pages = top_bottom_by_page
+
+    def _is_header_footer(
+        self, text: str, page_num: Optional[Union[str, int]] = None
+    ) -> bool:
+        if not text:
+            return False
+        self._build_header_footer_index()
+        norm = self._normalize_header_footer_text(text)
+        if not norm:
+            return False
+        if norm in self._header_footer_index:
+            return True
+        if page_num:
+            try:
+                page_int = int(float(page_num))
+            except Exception:
+                page_int = None
+            if page_int and norm in self._header_footer_pages.get(page_int, set()):
+                if self._header_footer_regex.search(norm):
+                    return True
+        return False
+
+    def _filter_header_footer_from_section(
+        self, section_root: ET.Element
+    ) -> ET.Element:
+        filtered = copy.deepcopy(section_root)
+        for parent in filtered.iter():
+            for child in list(parent):
+                if child.tag not in ["Paragraph", "Heading", "Title", "Caption"]:
+                    continue
+                if not child.text:
+                    continue
+                page_num = child.get("page_num") or parent.get("page_num")
+                if self._is_header_footer(child.text, page_num):
+                    parent.remove(child)
+        return filtered
 
     def _extract_plain_text(self, char_limit=6000):
         """Extract plain text segments for lightweight review."""
@@ -63,7 +161,7 @@ class DocAgent:
         for elem in self.doc_reader.root.iter():
             if elem.text and elem.tag in ["Paragraph", "Title", "Caption"]:
                 t = elem.text.strip()
-                if t:
+                if t and not self._is_header_footer(t, elem.get("page_num")):
                     texts.append(t)
             if sum(len(x) for x in texts) > char_limit:
                 break
@@ -105,13 +203,28 @@ class DocAgent:
     def _parse_json(self, raw_content):
         """Helper to safely extract and parse JSON from LLM response."""
         try:
-            start = raw_content.find("{")
-            end = raw_content.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                json_str = raw_content[start : end + 1]
-                parsed = json.loads(json_str)
-                return parsed
-            return json.loads(raw_content)
+            if not raw_content:
+                return {"issues": []}
+            json_block = re.search(r"<json>(.*?)</json>", raw_content, re.DOTALL)
+            if json_block:
+                raw_content = json_block.group(1).strip()
+            cleaned = re.sub(
+                r"<thinking>.*?</thinking>", "", raw_content, flags=re.DOTALL
+            ).strip()
+            cleaned = re.sub(
+                r"^```(?:json)?|```$", "", cleaned, flags=re.MULTILINE
+            ).strip()
+            decoder = json.JSONDecoder()
+            for candidate in [cleaned, raw_content]:
+                for idx in range(len(candidate)):
+                    if candidate[idx] not in "{[":
+                        continue
+                    try:
+                        obj, _ = decoder.raw_decode(candidate[idx:])
+                        return obj
+                    except Exception:
+                        continue
+            return json.loads(cleaned)
         except Exception as e:
             print(f"[Error] JSON parse failed: {str(e)[:200]}")
             print(f"[Error] Raw content preview: {raw_content[:500]}...")
@@ -199,14 +312,16 @@ class DocAgent:
                 model=self.model_id,
                 messages=messages,
                 max_tokens=500,
-                temperature=0.1,
+                temperature=0.0,
             )
             raw = response.choices[0].message.content
             data = self._parse_json(raw)
             if isinstance(data, list):
                 selected_sections = [str(x) for x in data][:max_sections]
             elif isinstance(data, dict) and "sections" in data:
-                selected_sections = [str(x) for x in data.get("sections", [])][:max_sections]
+                selected_sections = [str(x) for x in data.get("sections", [])][
+                    :max_sections
+                ]
             else:
                 selected_sections = []
 
@@ -224,7 +339,9 @@ class DocAgent:
                                 if node.tag in ["Heading", "Title"] and node.text:
                                     title_text = node.text
                                     break
-                            if any(keyword in title_text for keyword in ["目 录", "目录"]):
+                            if any(
+                                keyword in title_text for keyword in ["目 录", "目录"]
+                            ):
                                 toc_section = section_id
                                 break
                         except Exception:
@@ -242,9 +359,17 @@ class DocAgent:
                                 break
 
                         # 跳过封面、诚信承诺等非学术内容，但保留摘要、目录等重要内容
-                        skip_keywords = ["封面", "诚信", "承诺", "签名", "杭州電子科技大学"]
+                        skip_keywords = [
+                            "封面",
+                            "诚信",
+                            "承诺",
+                            "签名",
+                            "杭州電子科技大学",
+                        ]
                         keep_keywords = ["目 录", "目录", "摘要", "abstract", "摘 要"]
-                        if not any(keyword in title_text for keyword in skip_keywords) or any(keyword in title_text for keyword in keep_keywords):
+                        if not any(
+                            keyword in title_text for keyword in skip_keywords
+                        ) or any(keyword in title_text for keyword in keep_keywords):
                             filtered_sections.append(sid)
                     except Exception:
                         continue
@@ -294,8 +419,16 @@ class DocAgent:
                                 if node.tag in ["Heading", "Title"] and node.text:
                                     title_text = node.text
                                     break
-                            keep_keywords = ["目 录", "目录", "摘要", "abstract", "摘 要"]
-                            if not any(keyword in title_text for keyword in keep_keywords):
+                            keep_keywords = [
+                                "目 录",
+                                "目录",
+                                "摘要",
+                                "abstract",
+                                "摘 要",
+                            ]
+                            if not any(
+                                keyword in title_text for keyword in keep_keywords
+                            ):
                                 continue
                     except (ValueError, TypeError):
                         pass
@@ -672,12 +805,65 @@ class DocAgent:
         print("[Fact Conflict Detection] Analyzing cross-chapter conflicts...")
         conflicts = []
 
+        def _verify_entity_conflict(entity_key, occurrences):
+            """用 LLM 复核实体冲突，确认是否为真正矛盾"""
+            try:
+                sample = []
+                for occ in occurrences[:6]:
+                    sample.append(
+                        {
+                            "value": occ.get("value"),
+                            "source": occ.get("source"),
+                            "context": occ.get("context", "")[:200],
+                        }
+                    )
+
+                prompt = """
+你是学术文本一致性审查助手。请判断以下“同一实体键”的不同表述是否构成真正冲突。
+
+规则：
+1) 如果只是“别名/简称/同一公司不同写法”或“上下文不同但可兼容”，则不算冲突。
+2) 只有在明确相互矛盾（同一实体键被赋予不同且不可兼容的值）时，才算冲突。
+3) 请基于上下文判断是否可兼容。
+
+请输出严格 JSON：
+{"is_conflict": true/false, "reason": "..."}
+"""
+                messages = [
+                    {"role": "system", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {"entity_key": entity_key, "occurrences": sample},
+                            ensure_ascii=False,
+                        ),
+                    },
+                ]
+                response = self.client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=messages,
+                    max_tokens=800,
+                    temperature=0.0,
+                )
+                raw = response.choices[0].message.content
+                data = self._parse_json(raw)
+                if isinstance(data, dict) and "is_conflict" in data:
+                    return bool(data.get("is_conflict")), data.get("reason", "")
+            except Exception as e:
+                print(f"[Fact Conflict Verification] Failed: {e}")
+            return True, ""
+
         # 1. 检测实体冲突（如"甲方"在不同章节有不同的值）
         for entity_key, occurrences in self.fact_store["entities"].items():
             if len(occurrences) > 1:
                 # 检查是否有不同的值
                 unique_values = set(occ["value"] for occ in occurrences if occ["value"])
                 if len(unique_values) > 1:
+                    is_conflict, reason = _verify_entity_conflict(
+                        entity_key, occurrences
+                    )
+                    if not is_conflict:
+                        continue
                     conflicts.append(
                         {
                             "issue_type": "逻辑性-实体冲突",
@@ -694,6 +880,7 @@ class DocAgent:
                                         for occ in occurrences[:3]
                                     ]
                                 )
+                                + (f"。复核说明：{reason}" if reason else "")
                             ),
                         }
                     )
@@ -782,8 +969,9 @@ class DocAgent:
                 if node.tag in ["Heading", "Title"] and node.text:
                     title_text = node.text
                     break
-            # Serialize subtree to text (XML string)
-            content_xml = ET.tostring(sec_root, encoding="unicode", method="xml")
+            # Serialize subtree to text (XML string) after filtering header/footer noise
+            filtered_root = self._filter_header_footer_from_section(sec_root)
+            content_xml = ET.tostring(filtered_root, encoding="unicode", method="xml")
             chapters.append(
                 {
                     "section_id": sid,
@@ -1077,6 +1265,7 @@ class DocAgent:
         self,
         vision_model_id="qwen3-vl-flash",
         max_images=50,
+        max_tables=20,
         vision_api_key=None,
         vision_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         include_page_image=False,
@@ -1093,8 +1282,8 @@ class DocAgent:
     你是一个专业的学术论文视觉审查助手。你的任务是审查论文中的图片及其上下文。
     
     【核心原则】
-    - 只关注"图片是否支持正文/标题的论述"。
-    - 如果图片内容和正文/标题不冲突、不矛盾，则视为"无问题"。
+    - 只关注"图片是否支持正文/标题的论述"以及"图片是否适合放在该段落中表达观点"。
+    - 如果图片内容与小标题、正文段落的观点一致且能支撑论述，则视为"无问题"。
     - 忽略所有与"图文一致性"无关的视觉瑕疵（如清晰度、美观度、水印、边框等）。
 
     【输入材料】
@@ -1115,17 +1304,19 @@ class DocAgent:
     - 是否包含目标图片？
     - 页面上是否有与该图片相关的Caption（如"图 2-5 XXX"）？
     - 页面上是否有与该图号相关的正文描述？
+    - 目标图片附近的完整段落（至少一整段），该段落在阐述什么观点？
     
     **重点**：
     - Caption通常紧贴图片下方或上方，是小号黑体字
     - 正文描述可能在图片前后，会引用图号（如"如图2-5所示..."）
     - Caption和正文描述可能跨页（图在前一页末尾，Caption在当前页开头）
     
-    **步骤3：综合判断图文一致性**
+    **步骤3：综合判断图文一致性与段落匹配性**
     基于你从三页截图中提取的真实信息：
     - Caption的真实内容是什么？（以截图为准，忽略文档流错误）
     - 正文对该图的描述是什么？
     - 图片内容是否与Caption和正文描述一致？
+    - 目标图片放在该段落是否合适：能否清晰支撑该段落的观点/论述？
 
     【严厉禁止】
     - 禁止评论图片清晰度、分辨率、字号大小。
@@ -1148,7 +1339,8 @@ class DocAgent:
        【步骤3：综合判断】
        真实Caption：...
        图片内容：...
-       一致性分析：...
+       与小标题/正文一致性：...
+       与段落观点匹配性：该图是否能准确表达该段观点？是否放置合理？...
        ```
     
     2. 然后输出 JSON：{"issues": [...]}
@@ -1215,6 +1407,10 @@ class DocAgent:
                         node = children[i]
                         if node.tag == "Paragraph" and node.text:
                             text = node.text.strip()
+                            if self._is_header_footer(
+                                text, node.get("page_num") or page_num
+                            ):
+                                continue
                             # 如果段落中包含其他图号（且不是当前图号），跳过以避免混淆
                             # 提取当前caption中的图号（如果有）
                             current_fig_num = None
@@ -1236,7 +1432,12 @@ class DocAgent:
                                 caption_text = text
                             context_text.append(text)
                         elif node.tag == "Heading" and node.text:
-                            context_text.append(f"[Heading: {node.text}]")
+                            heading_text = node.text.strip()
+                            if self._is_header_footer(
+                                heading_text, node.get("page_num") or page_num
+                            ):
+                                continue
+                            context_text.append(f"[Heading: {heading_text}]")
                 except ValueError:
                     pass
 
@@ -1247,6 +1448,49 @@ class DocAgent:
                     "page_num": page_num,
                     "caption": caption_text,
                     "context": context_str,
+                }
+
+        table_info_map = {}
+        for elem in self.doc_reader.root.iter("CSV_Table"):
+            table_id = elem.get("table_id")
+            page_num = elem.get("page_num")
+            context_text = []
+
+            parent = parent_map.get(elem)
+            if parent:
+                try:
+                    children = list(parent)
+                    idx = children.index(elem)
+                    start_idx = max(0, idx - 2)
+                    end_idx = min(len(children), idx + 2)
+                    for i in range(start_idx, end_idx):
+                        node = children[i]
+                        if node.tag == "Paragraph" and node.text:
+                            text = node.text.strip()
+                            if self._is_header_footer(
+                                text, node.get("page_num") or page_num
+                            ):
+                                continue
+                            context_text.append(text)
+                        elif node.tag == "Heading" and node.text:
+                            heading_text = node.text.strip()
+                            if self._is_header_footer(
+                                heading_text, node.get("page_num") or page_num
+                            ):
+                                continue
+                            context_text.append(f"[Heading: {heading_text}]")
+                except ValueError:
+                    pass
+
+            caption_text = (elem.text or "").strip()
+            if len(caption_text) > 120:
+                caption_text = caption_text[:120] + "..."
+
+            if table_id:
+                table_info_map[str(table_id)] = {
+                    "page_num": page_num,
+                    "caption": caption_text,
+                    "context": "\n".join(context_text),
                 }
 
         # Process images
@@ -1286,35 +1530,35 @@ class DocAgent:
                 for idx, p_num in enumerate(pages_to_fetch):
                     if p_num < 1 or p_num > self.doc_reader.num_page:
                         continue
-                try:
-                    page_media_type, page_base64_img, page_err = (
-                        self.doc_reader.get_page_image(p_num)
-                    )
-                    if not page_err:
-                        # 明确标注页面顺序：前一页、当前页、后一页
-                        label = (
-                            page_labels[idx]
-                            if idx < len(page_labels)
-                            else f"Page {p_num}"
+                    try:
+                        page_media_type, page_base64_img, page_err = (
+                            self.doc_reader.get_page_image(p_num)
                         )
-                        page_image_block.append(
-                            {
-                                "type": "text",
-                                "text": f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n【{label}：Page {p_num}】\n请仔细查看本页是否包含目标图片，以及是否有相关的Caption或正文描述。\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                            }
+                        if not page_err:
+                            # 明确标注页面顺序：前一页、当前页、后一页
+                            label = (
+                                page_labels[idx]
+                                if idx < len(page_labels)
+                                else f"Page {p_num}"
+                            )
+                            page_image_block.append(
+                                {
+                                    "type": "text",
+                                    "text": f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n【{label}：Page {p_num}】\n请仔细查看本页是否包含目标图片，以及是否有相关的Caption或正文描述。\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                                }
+                            )
+                            page_image_block.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{page_media_type};base64,{page_base64_img}"
+                                    },
+                                }
+                            )
+                    except Exception as e:
+                        print(
+                            f"[Agent] [Vision] Failed to attach page image for page {p_num}: {e}"
                         )
-                        page_image_block.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{page_media_type};base64,{page_base64_img}"
-                                },
-                            }
-                        )
-                except Exception as e:
-                    print(
-                        f"[Agent] [Vision] Failed to attach page image for page {p_num}: {e}"
-                    )
 
             # Construct message for Vision Model
             messages = [
@@ -1407,6 +1651,153 @@ class DocAgent:
             except Exception as e:
                 print(f"Vision review failed for image {img_id}: {e}")
                 results.append({"image_id": img_id, "error": str(e)})
+
+        table_count = 0
+        total_tables = len(self.doc_reader.table_image_path_dict)
+        process_table_limit = min(max_tables, total_tables)
+        if total_tables:
+            print(
+                f"[Agent] Found {total_tables} tables, will review first {process_table_limit} tables."
+            )
+
+        for table_id in self.doc_reader.table_image_path_dict.keys():
+            if table_count >= max_tables:
+                break
+
+            media_type, base64_img, error = self.doc_reader.get_table_image(table_id)
+            if error:
+                print(f"Error loading table {table_id}: {error}")
+                continue
+
+            meta = table_info_map.get(
+                table_id, {"page_num": "?", "caption": "表格", "context": ""}
+            )
+
+            print(
+                f"[Agent] [Vision] Reviewing table {table_id} (Page {meta['page_num']}): {meta['caption'][:30]}..."
+            )
+
+            page_image_block = []
+            if include_page_image and str(meta["page_num"]).isdigit():
+                current_page = int(float(meta["page_num"]))
+                pages_to_fetch = [current_page - 1, current_page, current_page + 1]
+                page_labels = ["前一页", "当前页", "后一页"]
+
+                for idx, p_num in enumerate(pages_to_fetch):
+                    if p_num < 1 or p_num > self.doc_reader.num_page:
+                        continue
+                    try:
+                        page_media_type, page_base64_img, page_err = (
+                            self.doc_reader.get_page_image(p_num)
+                        )
+                        if not page_err:
+                            label = (
+                                page_labels[idx]
+                                if idx < len(page_labels)
+                                else f"Page {p_num}"
+                            )
+                            page_image_block.append(
+                                {
+                                    "type": "text",
+                                    "text": f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n【{label}：Page {p_num}】\n请仔细查看本页是否包含目标表格，以及是否有相关的Caption或正文描述。\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                                }
+                            )
+                            page_image_block.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{page_media_type};base64,{page_base64_img}"
+                                    },
+                                }
+                            )
+                    except Exception as e:
+                        print(
+                            f"[Agent] [Vision] Failed to attach page image for page {p_num}: {e}"
+                        )
+
+            messages = [
+                {"role": "system", "content": vision_system_prompt_cn},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 【图文一致性审查任务】(表格)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📎 **文档流参考信息**（可能不准确，仅供参考）：
+- 表格ID: {table_id}
+- 预估页码: {meta['page_num']}
+- 提取的表格内容: {meta['caption']}
+- 上下文片段: {meta['context'][:150]}{'...' if len(meta['context']) > 150 else ''}
+
+⚠️ **警告**：上述信息由PDF解析器提取，可能存在图号混乱、Caption错误、context混入其他图片描述等问题。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎯 **请严格按照三步流程进行审查**：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+**第1步：视觉定位**
+- 下方第一张图是【目标表格截图】，记住它的视觉特征
+- 在后续的三张页面截图中，找到该表格出现在哪一页
+
+**第2步：依次解析三页内容（重要！）**
+按照【前一页 → 当前页 → 后一页】的顺序，逐页提取：
+- 该页是否包含目标表格？
+- 是否有Caption（如"表 2-1 XXX"）？
+- 是否有正文描述（如"如表2-1所示..."）？
+
+**第3步：综合判断**
+- 汇总从三页中提取的真实Caption和描述
+- 判断表格内容是否与Caption、正文一致
+- 以你从页面截图中看到的为准，而不是文档流信息
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+👇 **下方是目标表格和三页连续截图**
+
+【目标表格】：""",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{base64_img}"
+                            },
+                        },
+                    ]
+                    + page_image_block,
+                },
+            ]
+
+            try:
+                response = client.chat.completions.create(
+                    model=vision_model_id,
+                    messages=messages,
+                    max_tokens=1000,
+                    temperature=0.0,
+                )
+                raw_content = response.choices[0].message.content
+                thinking = ""
+                thinking_match = re.search(
+                    r"<thinking>(.*?)</thinking>", raw_content, re.DOTALL
+                )
+                if thinking_match:
+                    thinking = thinking_match.group(1).strip()
+
+                results.append(
+                    {
+                        "image_id": f"table_{table_id}",
+                        "page": meta["page_num"],
+                        "caption": meta["caption"],
+                        "raw": raw_content,
+                        "thinking": thinking,
+                    }
+                )
+                table_count += 1
+            except Exception as e:
+                print(f"Vision review failed for table {table_id}: {e}")
+                results.append({"image_id": f"table_{table_id}", "error": str(e)})
 
         return results
 

@@ -24,6 +24,75 @@ class ImprovedJsonProcessor:
     def __init__(self):
         self.heading_pattern = re.compile(r'^(\d+\.|\d+\.\d+\.|第.+章)')
 
+    def _normalize_header_text(self, text: str) -> str:
+        return " ".join(str(text).strip().split())
+
+    def _infer_page_bounds(self, elements: list) -> Dict[int, float]:
+        page_max_y = {}
+        for element in elements:
+            page_idx = element.get("page_idx", 0)
+            bbox = element.get("bbox", [])
+            if isinstance(bbox, list) and len(bbox) >= 4:
+                try:
+                    max_y = float(bbox[3])
+                except Exception:
+                    continue
+                if page_idx not in page_max_y or max_y > page_max_y[page_idx]:
+                    page_max_y[page_idx] = max_y
+        return page_max_y
+
+    def _collect_header_footer_candidates(self, elements: list) -> Dict[str, set]:
+        page_max_y = self._infer_page_bounds(elements)
+        header_pages: Dict[str, set] = {}
+        footer_pages: Dict[str, set] = {}
+        page_indices = {element.get("page_idx", 0) for element in elements}
+        page_count = max(page_indices) + 1 if page_indices else 0
+        min_pages = max(2, int(page_count * 0.6))
+
+        for element in elements:
+            etype = (element.get("type") or "").lower()
+            if etype not in ["text", "paragraph"]:
+                continue
+            content = (element.get("content") or element.get("text") or "").strip()
+            if not content:
+                continue
+            cleaned = self._normalize_header_text(content)
+            if len(cleaned) > 80:
+                continue
+
+            page_idx = element.get("page_idx", 0)
+            bbox = element.get("bbox", [])
+            if not (isinstance(bbox, list) and len(bbox) >= 4):
+                continue
+            page_height = page_max_y.get(page_idx)
+            if not page_height:
+                continue
+
+            try:
+                y1 = float(bbox[1])
+                y2 = float(bbox[3])
+            except Exception:
+                continue
+
+            top_thresh = page_height * 0.12
+            bottom_thresh = page_height * 0.88
+            if y2 <= top_thresh:
+                header_pages.setdefault(cleaned, set()).add(page_idx)
+            elif y1 >= bottom_thresh:
+                footer_pages.setdefault(cleaned, set()).add(page_idx)
+
+        header_candidates = {
+            text for text, pages in header_pages.items() if len(pages) >= min_pages
+        }
+        footer_candidates = {
+            text for text, pages in footer_pages.items() if len(pages) >= min_pages
+        }
+        return {
+            "header": header_candidates,
+            "footer": footer_candidates,
+            "page_max_y": page_max_y,
+        }
+
     def process(self, root_path):
         """
         处理 MinerU 产物,生成带正确标题层级的 DataFrame
@@ -86,6 +155,11 @@ class ImprovedJsonProcessor:
             print(f"[Warning] JSON 中未找到有效数据")
             return None
 
+        header_footer_info = self._collect_header_footer_candidates(elements)
+        header_texts = header_footer_info["header"]
+        footer_texts = header_footer_info["footer"]
+        page_max_y = header_footer_info["page_max_y"]
+
         # 构建 DataFrame
         records = []
         curr_page = -1
@@ -119,16 +193,52 @@ class ImprovedJsonProcessor:
             if not content and etype not in ["image", "figure", "table"]:
                 continue
 
-            # 判定样式
-            style, item_id = self._determine_style_improved(
-                etype, content, font_size, text_level, element, image_count, table_count
-            )
+            # 判定页眉/页脚
+            header_footer_style = None
+            if etype in ["text", "paragraph"] and content:
+                cleaned = self._normalize_header_text(content)
+                if cleaned in header_texts or cleaned in footer_texts:
+                    if isinstance(bbox, list) and len(bbox) >= 4:
+                        page_height = page_max_y.get(page_idx)
+                        if page_height:
+                            try:
+                                y1 = float(bbox[1])
+                                y2 = float(bbox[3])
+                            except Exception:
+                                y1 = y2 = None
+                            if y1 is not None and y2 is not None:
+                                top_thresh = page_height * 0.12
+                                bottom_thresh = page_height * 0.88
+                                if cleaned in header_texts and y2 <= top_thresh:
+                                    header_footer_style = "Header"
+                                elif cleaned in footer_texts and y1 >= bottom_thresh:
+                                    header_footer_style = "Footer"
+
+            if header_footer_style:
+                style, item_id = header_footer_style, None
+            else:
+                # 判定样式
+                style, item_id = self._determine_style_improved(
+                    etype, content, font_size, text_level, element, image_count, table_count
+                )
 
             # 更新计数器
             if style == "Image":
                 image_count += 1
                 content = item_id
             elif style == "Table":
+                table_caption = (
+                    element.get("table_caption")
+                    or element.get("caption")
+                    or element.get("title")
+                    or element.get("name")
+                )
+                if isinstance(table_caption, list):
+                    table_caption = table_caption[0] if table_caption else None
+                if isinstance(table_caption, str):
+                    table_caption = table_caption.strip() or None
+                if content or table_caption:
+                    content = {"content": content, "alt_text": table_caption}
                 table_count += 1
 
             records.append({

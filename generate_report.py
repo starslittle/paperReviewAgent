@@ -1,6 +1,7 @@
 import json
 import argparse
 import os
+import re
 from datetime import datetime
 
 
@@ -17,6 +18,63 @@ def generate_html(json_path, output_path):
     low_count = len([i for i in issues if i.get("severity") == "Low"])
     total_score = max(0, 100 - (high_count * 5 + medium_count * 2 + low_count * 1))
 
+    # 分类问题
+    normative_issues = []
+    logic_issues = []
+    vision_issues = []
+    other_issues = []
+
+    # 页码排序辅助函数
+    def get_page_num(issue):
+        page = issue.get("page", "9999")
+        if isinstance(page, int):
+            return page
+        if isinstance(page, str):
+            # 处理 "12-14" 这种情况，取第一位数字
+            match = re.search(r"(\d+)", page)
+            if match:
+                return int(match.group(1))
+        return 9999
+
+    # 定义逻辑类别的集合
+    logic_types = {
+        "Logic",
+        "Language",
+        "Coherence",
+        "Cohesion",
+        "逻辑性",
+        "语言",
+        "连贯性",
+    }
+    normative_types = {"Format", "规范性"}
+    vision_types = {"Vision", "图文一致性"}
+
+    for issue in issues:
+        raw_type = issue.get("issue_type", "Unknown")
+        img_id = issue.get("image_id", "")
+
+        if img_id or raw_type in vision_types or "一致性" in raw_type:
+            vision_issues.append(issue)
+        elif raw_type in logic_types:
+            logic_issues.append(issue)
+        elif raw_type in normative_types:
+            normative_issues.append(issue)
+        else:
+            if "一致性" in raw_type or "图" in raw_type or "视觉" in raw_type:
+                vision_issues.append(issue)
+            elif "逻辑" in raw_type or "语言" in raw_type or "连贯" in raw_type:
+                logic_issues.append(issue)
+            elif "格式" in raw_type or "规范" in raw_type:
+                normative_issues.append(issue)
+            else:
+                other_issues.append(issue)
+
+    # 在各分类内按页码排序
+    normative_issues.sort(key=get_page_num)
+    logic_issues.sort(key=get_page_num)
+    vision_issues.sort(key=get_page_num)
+    other_issues.sort(key=get_page_num)
+
     # HTML 模板
     html = f"""
     <!DOCTYPE html>
@@ -28,6 +86,10 @@ def generate_html(json_path, output_path):
             body {{ font-family: 'Segoe UI', sans-serif; background: #f5f7fa; color: #333; margin: 0; padding: 20px; }}
             .container {{ max_width: 1000px; margin: 0 auto; background: white; padding: 40px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); border-radius: 8px; }}
             h1 {{ border-bottom: 2px solid #eaeaea; padding-bottom: 10px; }}
+            h2 {{ color: #2c3e50; border-left: 5px solid #3498db; padding-left: 15px; margin-top: 40px; margin-bottom: 20px; }}
+            .category-header {{ background: #ecf0f1; padding: 10px 20px; border-radius: 6px; margin-top: 30px; margin-bottom: 15px; font-size: 1.2em; font-weight: bold; color: #34495e; border-bottom: 2px solid #bdc3c7; transition: background 0.3s; }}
+            .category-header:hover {{ background: #dfe6e9; }}
+            .category-container {{ transition: all 0.3s ease; }}
             .dashboard {{ display: flex; gap: 20px; margin-bottom: 30px; }}
             .card {{ flex: 1; padding: 20px; border-radius: 8px; text-align: center; color: white; }}
             .bg-blue {{ background: #3498db; }}
@@ -47,19 +109,22 @@ def generate_html(json_path, output_path):
             .thinking-box {{ background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px; margin-top: 20px; }}
             .thinking-header {{ padding: 10px 15px; background: #e9ecef; cursor: pointer; font-weight: bold; display: flex; justify-content: space-between; align-items: center; }}
             .thinking-content {{ padding: 15px; display: none; background: #fff; color: #333; font-family: 'Segoe UI', sans-serif; line-height: 1.6; }}
-            .thinking-content h1, .thinking-content h2, .thinking-content h3 {{ margin-top: 1em; margin-bottom: 0.5em; color: #2c3e50; }}
-            .thinking-content p {{ margin-bottom: 1em; }}
+            .thinking-content h1, .thinking-content h2, .thinking-content h3 {{ margin-top: 1.5em; margin-bottom: 0.8em; color: #2c3e50; border-bottom: 1px solid #eee; padding-bottom: 5px; }}
+            .thinking-content h3 {{ color: #2980b9; border-left: 4px solid #2980b9; padding-left: 10px; background: #f0f7fd; padding: 8px 10px; border-radius: 4px; }}
+            .thinking-content p {{ margin-bottom: 1em; line-height: 1.7; }}
             .thinking-content ul, .thinking-content ol {{ margin-left: 20px; margin-bottom: 1em; }}
             .thinking-content code {{ background: #f1f3f5; padding: 2px 4px; border-radius: 3px; font-family: Consolas, monospace; color: #c7254e; }}
             .thinking-content pre {{ background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto; border: 1px solid #ddd; }}
             .thinking-content pre code {{ background: none; color: inherit; padding: 0; }}
             .meta {{ font-size: 0.9em; color: #7f8c8d; margin-bottom: 5px; }}
+            .empty-msg {{ color: #95a5a6; font-style: italic; padding: 10px; }}
         </style>
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <script>
             function toggle(id) {{
                 var x = document.getElementById(id);
-                if (x.style.display === "none" || x.style.display === "") {{
+                var currentDisplay = window.getComputedStyle(x).display;
+                if (currentDisplay === "none") {{
                     x.style.display = "block";
                 }} else {{
                     x.style.display = "none";
@@ -69,11 +134,18 @@ def generate_html(json_path, output_path):
                 var markdownDivs = document.querySelectorAll(".markdown-content");
                 markdownDivs.forEach(function(div) {{
                     var rawContent = div.textContent.trim();
-                    // Fix: Add newlines before each [Image X] thinking block to ensure they render as separate paragraphs/headers
-                    // This regex looks for [Image and adds two newlines before it
-                    // Also make "Image X" bold using markdown syntax
-                    var processedContent = rawContent.replace(/(\\[Image\\s+.*?\\]:)/g, '\\n\\n**$1**\\n');
-                    div.innerHTML = marked.parse(processedContent);
+                    if (!rawContent || rawContent === "无思考过程") return;
+                    
+                    try {{
+                        var processedContent = rawContent.replace(/^\[Image\s+(.*?)\s*\|\s*Page\s+(.*?)\]\s*(.*)/gm, '### 🖼️ 图片分析: $1 (第 $2 页)\\n\\n$3');
+                        processedContent = processedContent.replace(/\[Image\s+(.*?)\s*\|\s*Page\s+(.*?)\]\s*(.*)/g, '\\n\\n### 🖼️ 图片分析: $1 (第 $2 页)\\n\\n$3');
+                        
+                        if (typeof marked !== 'undefined') {{
+                            div.innerHTML = marked.parse(processedContent);
+                        }}
+                    }} catch (e) {{
+                        console.error("Markdown parse error:", e);
+                    }}
                 }});
             }});
         </script>
@@ -141,57 +213,91 @@ def generate_html(json_path, output_path):
         "Logic": "逻辑性",
         "Language": "语言",
         "Coherence": "连贯性",
-        "Cohesion": "连贯性",  # 兼容旧版拼写
+        "Cohesion": "连贯性",
         "Vision": "图文一致性",
         "Unknown": "未分类",
     }
 
-    for idx, issue in enumerate(issues):
-        severity = issue.get("severity", "Medium")
-        raw_issue_type = issue.get("issue_type", "Unknown")
-        # 如果是英文类型，自动转换为中文
-        issue_type_base = type_mapping.get(raw_issue_type, raw_issue_type)
-        # 在类型后面加上"问题"
-        issue_type = (
-            f"{issue_type_base}问题" if issue_type_base != "未分类" else issue_type_base
-        )
-        page = issue.get("page", "N/A")
-        img_id = issue.get("image_id", "")
-
-        suggestion_short = (
-            issue.get("suggestion", "")[:40] + "..."
-            if len(issue.get("suggestion", "")) > 40
-            else issue.get("suggestion", "")
-        )
-
-        title_text = f"[{issue_type}] 第 {page} 页: {suggestion_short}"
-        if img_id:
-            title_text = f"[视觉/图{img_id}] " + title_text
-
+    def render_issues(issue_list, title, start_idx, cat_id):
+        nonlocal html
         html += f"""
-            <div class="issue-card">
-                <div class="issue-header" onclick="toggle('issue_{idx}')">
-                    <span>
-                        <span class="badge {severity}">{severity}</span>
-                        <strong>{title_text}</strong>
-                    </span>
-                    <span>▼</span>
-                </div>
-                <div id="issue_{idx}" class="issue-body">
-                    <div class="meta">📍 位置: 第 {page} 页 | 章节: {issue.get('section', '未知')}</div>
-                    
-                    <div class="quote">
-                        <strong>原文片段/描述:</strong><br>
-                        {issue.get('quote', '无引用')}
-                    </div>
-                    
-                    <div class="suggestion">
-                        <strong>🤖 AI 修改建议:</strong><br>
-                        {issue.get('suggestion', '无建议')}
-                    </div>
-                </div>
+            <div class="category-header" onclick="toggle('{cat_id}')" style="cursor: pointer; display: flex; justify-content: space-between; align-items: center;">
+                <span>{title} ({len(issue_list)})</span>
+                <span>▼</span>
             </div>
+            <div id="{cat_id}" class="category-container">
         """
+        if not issue_list:
+            html += '<div class="empty-msg">未发现该类别问题</div>'
+            html += "</div>"
+            return start_idx
+
+        for i, issue in enumerate(issue_list):
+            idx = start_idx + i
+            severity = issue.get("severity", "Medium")
+            raw_issue_type = issue.get("issue_type", "Unknown")
+            issue_type_base = type_mapping.get(raw_issue_type, raw_issue_type)
+            issue_type = (
+                f"{issue_type_base}问题"
+                if issue_type_base != "未分类"
+                else issue_type_base
+            )
+            page = issue.get("page", "N/A")
+            img_id = issue.get("image_id", "")
+
+            suggestion_short = (
+                issue.get("suggestion", "")[:40] + "..."
+                if len(issue.get("suggestion", "")) > 40
+                else issue.get("suggestion", "")
+            )
+
+            title_text = f"[{issue_type}] 第 {page} 页: {suggestion_short}"
+            if img_id:
+                title_text = f"[图表 {img_id}] " + title_text
+
+            html += f"""
+                <div class="issue-card">
+                    <div class="issue-header" onclick="toggle('issue_{idx}')">
+                        <span>
+                            <span class="badge {severity}">{severity}</span>
+                            <strong>{title_text}</strong>
+                        </span>
+                        <span>▼</span>
+                    </div>
+                    <div id="issue_{idx}" class="issue-body">
+                        <div class="meta">📍 位置: 第 {page} 页 | 章节: {issue.get('section', '未知')}</div>
+                        
+                        <div class="quote">
+                            <strong>原文片段/描述:</strong><br>
+                            {issue.get('quote', '无引用')}
+                        </div>
+                        
+                        <div class="suggestion">
+                            <strong>🤖 AI 修改建议:</strong><br>
+                            {issue.get('suggestion', '无建议')}
+                        </div>
+                    </div>
+                </div>
+            """
+        html += "</div>"
+        return start_idx + len(issue_list)
+
+    # 按类别渲染
+    current_idx = 0
+    current_idx = render_issues(
+        normative_issues, "📏 规范性一致性问题", current_idx, "cat_norm"
+    )
+    current_idx = render_issues(
+        logic_issues, "🧠 逻辑性一致性问题", current_idx, "cat_logic"
+    )
+    current_idx = render_issues(
+        vision_issues, "🖼️ 图文一致性问题", current_idx, "cat_vision"
+    )
+
+    if other_issues:
+        current_idx = render_issues(
+            other_issues, "❓ 其他分类问题", current_idx, "cat_other"
+        )
 
     html += """
         </div>
