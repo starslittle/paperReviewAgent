@@ -35,6 +35,7 @@ normative_prompt = """
 1. **漏识别标题**：某些小节标题（如 4.1, 4.2）可能被误解析为普通段落，导致大纲中缺失。因此，**如果看到 4.3 存在，请不要直接断定 4.1 缺失，除非你在正文中也完全找不到对应的粗体文本**。
 2. **页码偏差**：大纲中的页码是物理页序（从第1张纸开始算），而目录中的页码是逻辑页序（可能跳过封面）。请忽略 10 页以内的页码误差。
 3. **嵌套错误**：部分子章节可能被错误地挂载到了上一级章节。
+4. **标题断行允许**：论文题目或章节标题可以出现在多行（合理断行），这不是格式错误，除非出现明显断裂导致含义不完整。
 
 步骤：
 1. 在 <thinking> 标签内简要说明你的检查思路（聚焦格式）。
@@ -42,7 +43,7 @@ normative_prompt = """
    - <thinking>...</thinking>
    - <json>...</json>
    除此以外不要输出任何额外文本或 Markdown。
-3. <json> 中的 JSON 格式如下：
+3. <json> 中的 JSON 格式如下（issue_type 必须固定为 "规范性"）：
 {
   "issues": [
     {
@@ -68,37 +69,37 @@ normative_prompt = """
 """
 
 vision_verify_prompt = """
-你是一个文档排版核查员。你的任务是通过查看页面截图，验证文本分析提出的"格式问题"是真实存在，还是PDF解析器的误判。
+你是一个文档排版核查员。你的任务是通过查看页面截图，判断文本分析提出的"格式问题"是否真实存在。
 
 【待验证的问题】："{issue_description}"
 【当前页面截图】：(见附图)
 
-请仔细观察截图，判断该问题是否为"误报 (False Positive)"：
+请仔细观察截图，判断该问题是否为**真实存在**：
 
 **判断标准**：
 - 如果问题是"缺少章节X.X"，请在截图中寻找是否有对应编号的章节标题
-  - **若截图中能找到该标题** → 说明PDF解析器遗漏了，问题是**误报**，`is_false_positive = true`
-  - **若截图中确实没有该标题** → 说明问题真实存在，`is_false_positive = false`
+  - **若截图中能找到该标题** → 说明PDF解析器遗漏了，问题是**误报**，`is_real = false`
+  - **若截图中确实没有该标题** → 说明问题真实存在，`is_real = true`
 
 - 如果问题是"页码错误"，请查看页脚的页码数字
-  - **若页码显示正确** → 问题是误报，`is_false_positive = true`
-  - **若页码确实错误或缺失** → 问题真实存在，`is_false_positive = false`
+  - **若页码显示正确** → 问题是误报，`is_real = false`
+  - **若页码确实错误或缺失** → 问题真实存在，`is_real = true`
 
 **输出格式**（严格JSON）：
 {{
-    "is_false_positive": true或false,
+    "is_real": true或false,
     "reason": "简要说明理由（1-2句话）"
 }}
 
 **示例1**（问题为误报）：
 输入：缺少章节"4.1 系统分析"
 截图：清晰显示有"4.1 系统分析"标题
-输出：{{"is_false_positive": true, "reason": "截图中第22页清晰显示'4.1 系统分析'标题位于页面上方，PDF解析器遗漏了该章节。"}}
+输出：{{"is_real": false, "reason": "截图中第22页清晰显示'4.1 系统分析'标题位于页面上方，PDF解析器遗漏了该章节。"}}
 
 **示例2**（问题属实）：
 输入：缺少章节"2.2 YOLO模型"
 截图：只看到"2.1 目标检测"，没有2.2节
-输出：{{"is_false_positive": false, "reason": "截图中只显示2.1节标题，确实没有2.2节，问题属实。"}}
+输出：{{"is_real": true, "reason": "截图中只显示2.1节标题，确实没有2.2节，问题属实。"}}
 """
 
 local_chapter_review_prompt = """
@@ -227,7 +228,11 @@ vision_prompt = """
 1. **内容一致性检查**：仔细阅读图片内容（包含图中的文字、数据趋势、流程步骤）和提供的“相关正文片段”。判断图片是否准确反映了正文描述的内容？是否存在数据矛盾或流程不符？
 2. **规范性与质量检查**：图片是否清晰？图题（Caption）是否准确概括图片内容？图例和坐标轴是否完整？
 3. 在 <thinking> 标签内简述你的观察和推理过程。
-4. 在 <thinking> 标签后，只输出 JSON，格式：
+4. 在 <thinking> 标签后只输出 <json> 块。输出必须包含且仅包含以下两个块：
+   - <thinking>...</thinking>
+   - <json>...</json>
+   除此以外不要输出任何额外文本或 Markdown。
+5. <json> 中的 JSON 格式：
 {
   "issues": [
     {
@@ -242,6 +247,7 @@ vision_prompt = """
   ]
 }
 如果图片质量很好且与正文逻辑一致，输出空数组 "issues": []。
+要求：<json> 中的 issues 必须完整覆盖你在 thinking 中提到的所有问题。
 """
 
 reflection_prompt_template = """Please update the reflection listed within the <guideline></guideline> tags below that can help you perform better next time. Provide the updated guidance within the <updated_guideline></updated_guideline> tags. Be concise and clear. Ensure the revised guideline deviates from the original by at most one sentence.

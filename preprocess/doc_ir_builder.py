@@ -478,24 +478,26 @@ class DocIRBuilder:
 
             if style.startswith("Heading"):
                 heading_text = row["para_text"].strip()
-                header_footer_type = _classify_header_footer_text(
-                    heading_text,
-                    current_page,
-                    header_index,
-                    footer_index,
-                    header_top_by_page,
-                    header_bottom_by_page,
-                )
-                if header_footer_type:
-                    _append_header_footer(
-                        heading_text, current_page, header_footer_type
-                    )
-                    continue
                 heading_level = (
                     inferred_heading
                     if inferred_heading is not None
                     else self._get_heading_level(heading_text)
                 )
+                # 若已识别为标题层级，则不进行页眉/页脚归类
+                if heading_level is None:
+                    header_footer_type = _classify_header_footer_text(
+                        heading_text,
+                        current_page,
+                        header_index,
+                        footer_index,
+                        header_top_by_page,
+                        header_bottom_by_page,
+                    )
+                    if header_footer_type:
+                        _append_header_footer(
+                            heading_text, current_page, header_footer_type
+                        )
+                        continue
 
                 print(f"[Heading] Level {heading_level}: {heading_text[:50]}...")
 
@@ -713,6 +715,8 @@ class DocIRBuilder:
                 current_section_node, current_section_id, _ = section_stack[-1]
                 table_image_path = None
                 figure_image_path = None
+                crop_box = None
+                page_image = None
                 bbox = self._parse_bbox(row.get("bbox"))
                 if bbox and os.path.isdir(page_images_dir):
                     if page_idx not in page_image_cache:
@@ -737,25 +741,7 @@ class DocIRBuilder:
                         right = min(page_image.width, int(x2 * scale_x) + pad)
                         bottom = min(page_image.height, int(y2 * scale_y) + pad)
                         if right > left and bottom > top:
-                            os.makedirs(table_images_dir, exist_ok=True)
-                            table_filename = (
-                                f"table_{table_count:04d}_page_{current_page:04d}.png"
-                            )
-                            table_path = os.path.join(table_images_dir, table_filename)
-                            page_image.crop((left, top, right, bottom)).save(table_path)
-                            table_image_path = table_filename
-                            table_image_path_dict[str(table_count)] = table_filename
-
-                            figures_dir = os.path.join(data_path, "figures")
-                            os.makedirs(figures_dir, exist_ok=True)
-                            figure_filename = (
-                                f"figure_{image_count:04d}_page_{current_page:04d}.png"
-                            )
-                            figure_path = os.path.join(figures_dir, figure_filename)
-                            page_image.crop((left, top, right, bottom)).save(
-                                figure_path
-                            )
-                            figure_image_path = figure_filename
+                            crop_box = (left, top, right, bottom)
 
                 # Table 的 para_text 可能是字典
                 table_content = row["para_text"]
@@ -771,8 +757,17 @@ class DocIRBuilder:
                     current_page, index, figure_caption_index
                 )
 
-                # 若小标题是“图”，则不按表格处理，改为图片
-                if figure_alt_text and not table_alt_text:
+                # 仅当附近确实有“表”标题时才按表格处理，否则视为图片
+                if not table_alt_text:
+                    if crop_box and page_image:
+                        figures_dir = os.path.join(data_path, "figures")
+                        os.makedirs(figures_dir, exist_ok=True)
+                        figure_filename = (
+                            f"figure_{image_count:04d}_page_{current_page:04d}.png"
+                        )
+                        figure_path = os.path.join(figures_dir, figure_filename)
+                        page_image.crop(crop_box).save(figure_path)
+                        figure_image_path = figure_filename
                     if figure_image_path:
                         image_path_dict[str(image_count)] = figure_image_path
                     image = ET.SubElement(
@@ -794,6 +789,16 @@ class DocIRBuilder:
                     )
                     image_count += 1
                     continue
+
+                if crop_box and page_image:
+                    os.makedirs(table_images_dir, exist_ok=True)
+                    table_filename = (
+                        f"table_{table_count:04d}_page_{current_page:04d}.png"
+                    )
+                    table_path = os.path.join(table_images_dir, table_filename)
+                    page_image.crop(crop_box).save(table_path)
+                    table_image_path = table_filename
+                    table_image_path_dict[str(table_count)] = table_image_path
 
                 table_attrs = {
                     "table_id": str(table_count),

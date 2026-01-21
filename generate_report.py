@@ -140,6 +140,10 @@ def generate_html(json_path, output_path):
                         var processedContent = rawContent.replace(/^\[Image\s+(.*?)\s*\|\s*Page\s+(.*?)\]\s*(.*)/gm, '### 🖼️ 图片分析: $1 (第 $2 页)\\n\\n$3');
                         processedContent = processedContent.replace(/\[Image\s+(.*?)\s*\|\s*Page\s+(.*?)\]\s*(.*)/g, '\\n\\n### 🖼️ 图片分析: $1 (第 $2 页)\\n\\n$3');
                         
+                        // 修复视觉验证环节的图标：移除误报用勾，保留Issue用叉
+                        processedContent = processedContent.replace(/❌\\s+\*\*移除误报/g, '✅ **移除误报');
+                        processedContent = processedContent.replace(/✅\\s+\*\*保留\\s+Issue/g, '❌ **保留 Issue');
+                        
                         if (typeof marked !== 'undefined') {{
                             div.innerHTML = marked.parse(processedContent);
                         }}

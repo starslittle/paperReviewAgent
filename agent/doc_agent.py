@@ -214,6 +214,8 @@ class DocAgent:
             cleaned = re.sub(
                 r"^```(?:json)?|```$", "", cleaned, flags=re.MULTILINE
             ).strip()
+            if not cleaned:
+                return {"issues": []}
             decoder = json.JSONDecoder()
             for candidate in [cleaned, raw_content]:
                 for idx in range(len(candidate)):
@@ -459,11 +461,11 @@ class DocAgent:
     def verify_with_vision(self, issue):
         """
         Verify a normative issue using Vision Model.
-        Returns (is_false_positive, reason_str).
+        Returns (is_real, reason_str). is_real=None means unverifiable.
         """
         page = issue.get("page")
         if not page or not str(page).isdigit():
-            return False, "无法验证：缺少有效页码"
+            return None, "无法验证：缺少有效页码"
 
         page_num = int(float(page))
         suggestion = issue.get("suggestion", "")
@@ -482,7 +484,7 @@ class DocAgent:
         try:
             media_type, base64_img, error = self.doc_reader.get_page_image(page_num)
             if error:
-                return False, f"无法加载图片: {error}"
+                return None, f"无法加载图片: {error}"
 
             prompt = vision_verify_prompt.format(issue_description=suggestion)
 
@@ -512,7 +514,7 @@ class DocAgent:
             vision_api_key = os.getenv("DASHSCOPE_API_KEY")
             if not vision_api_key:
                 print("[Verification] Skipped: DASHSCOPE_API_KEY not found.")
-                return False, "缺少 Vision API Key"
+                return None, "缺少 Vision API Key"
 
             from openai import OpenAI
 
@@ -529,11 +531,13 @@ class DocAgent:
             )
 
             res_json = self._parse_json(response.choices[0].message.content)
-            is_false_positive = res_json.get("is_false_positive", False)
+            is_real = res_json.get("is_real")
+            if is_real is None:
+                is_real = not res_json.get("is_false_positive", False)
             reason = res_json.get("reason", "无理由")
 
             # 兜底修正：通过 reason 的语义判断真实意图，纠正 JSON 字段可能的错误
-            # 如果 reason 明确表示"问题属实/确实缺失/确实存在问题"，则应该是 False（不是误报）
+            # 如果 reason 明确表示"问题属实/确实缺失/确实存在问题"，则应该是 True（真实存在）
             true_issue_markers = [
                 "问题属实",
                 "确实缺失",
@@ -543,7 +547,7 @@ class DocAgent:
                 "实际缺失",
                 "内容缺失",
             ]
-            # 如果 reason 明确表示"误报/不成立/解析器遗漏/实际存在"，则应该是 True（是误报）
+            # 如果 reason 明确表示"误报/不成立/解析器遗漏/实际存在"，则应该是 False（误报）
             false_positive_markers = [
                 "误报",
                 "误判",
@@ -559,26 +563,27 @@ class DocAgent:
 
             # 优先根据语义判断
             if any(m in reason for m in true_issue_markers):
-                is_false_positive = False  # 问题真实存在
+                is_real = True  # 问题真实存在
                 print(
                     f"[Verification] Issue is REAL (corrected by reason): {reason[:60]}..."
                 )
             elif any(m in reason for m in false_positive_markers):
-                is_false_positive = True  # 问题是误报
+                is_real = False  # 问题是误报
                 print(
                     f"[Verification] False positive detected (corrected by reason): {reason[:60]}..."
                 )
 
-            return is_false_positive, reason
+            return is_real, reason
 
         except Exception as e:
             print(f"[Verification] Failed: {e}")
-            return False, str(e)
+            return None, str(e)
 
     def run_normative_review(self):
         """规范性审查，不使用工具，返回包含 raw 和 thinking 的字典。"""
         print("[Agent] Starting Normative Review...")
         res = self._run_simple_review(normative_prompt)
+        res["raw_original"] = res.get("raw", "")
 
         # Debug: 显示原始输出的前500字符
         print(f"[Debug] Normative raw output preview: {res.get('raw', '')[:500]}...")
@@ -602,16 +607,22 @@ class DocAgent:
                 print(
                     f"[Verification] Checking issue: {issue.get('suggestion', '')[:60]}..."
                 )
-                is_fp, reason = self.verify_with_vision(issue)
-                if not is_fp:
+                is_real, reason = self.verify_with_vision(issue)
+                if is_real is None:
                     verified_issues.append(issue)
-                    verification_log += f"- ✅ **保留 Issue**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 问题属实或无法排除。({reason})\n"
+                    verification_log += f"- ❌ **保留 Issue**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 无法验证，默认保留。({reason})\n"
                     print(
-                        f"[Verification] ✅ Issue kept: {issue.get('suggestion', '')[:40]}..."
+                        f"[Verification] ⚠️ Issue kept (unverifiable): {issue.get('suggestion', '')[:40]}..."
+                    )
+                elif is_real:
+                    verified_issues.append(issue)
+                    verification_log += f"- ❌ **保留 Issue**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 问题属实或无法排除。({reason})\n"
+                    print(
+                        f"[Verification] ❌ Issue kept: {issue.get('suggestion', '')[:40]}..."
                     )
                 else:
-                    verification_log += f"- ❌ **移除误报 (False Positive)**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 页面截图显示该内容实际存在，系解析器遗漏。({reason})\n"
-                    print(f"[Verification] ❌ Issue removed as false positive")
+                    verification_log += f"- ✅ **移除误报 (False Positive)**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 页面截图显示该内容实际存在，系解析器遗漏。({reason})\n"
+                    print(f"[Verification] ✅ Issue removed as false positive")
             else:
                 verified_issues.append(issue)
                 print(

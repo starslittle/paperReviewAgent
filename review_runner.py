@@ -6,12 +6,14 @@ Outputs JSON issues per document.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from agent import doc_agent
 from agent import doc_reader
+from agent.vision_agent import VisionAgent
 
 
 def parse_args():
@@ -157,13 +159,13 @@ def main():
             base_url=args.base_url,
         )
 
-        # 1. 规范性审查
-        print(f"[Agent] [Normative] Starting...")
-        norm_res = agent.run_normative_review()
+        # 1. 规范性审查 - 已禁用
+        norm_out = {"parsed": {"issues": []}, "thinking": ""}
+        norm_res = {"raw": "", "thinking": ""}
 
-        # 2. 逻辑审查 (Map-Reduce 层次化)
-        print(f"[Agent] [Logic] Starting...")
-        logic_res = agent.run_hierarchical_logic_review()
+        # 2. 逻辑审查 (Map-Reduce 层次化) - 已禁用
+        logic_out = {"parsed": {"issues": []}, "thinking": ""}
+        logic_res = {"raw": "", "thinking": ""}
 
         def _parse(res):
             content = res.get("raw", "")
@@ -196,54 +198,31 @@ def main():
             except Exception:
                 return {"issues": [], "error": "parse_failed"}
 
+        # 3. 视觉审查 - 已启用
         vision_data = {"issues": []}
         vision_thinking = ""
         if reader.image_path_dict or reader.table_image_path_dict:
-            print(f"[Agent] [Vision] Starting...")
-            vision_res = agent.run_vision_review(
+            print("[Agent] [Vision] Starting...")
+            vision_agent = VisionAgent(agent)
+            vision_out = vision_agent.run(
                 vision_model_id=args.vision_model,
                 vision_api_key=args.vision_api_key,
                 vision_base_url=args.vision_base_url,
                 include_page_image=True,
             )
-            vision_issues = []
-            vision_thinking_list = []
-            for v in vision_res:
-                if "error" in v:
-                    continue
-                v_data = _parse(v)
-                v_issues = v_data.get("issues", [])
-                if isinstance(v_issues, list):
-                    for iss in v_issues:
-                        if isinstance(iss, dict) and not iss.get("page"):
-                            iss["page"] = v.get("page")
-                    vision_issues.extend([iss for iss in v_issues if isinstance(iss, dict)])
-                if v.get("thinking"):
-                    # 统一使用明显的 Markdown 标题格式
-                    header = f"### 🖼️ 图片分析: {v.get('image_id', 'unknown')} (第 {v.get('page', '?')} 页)"
-                    vision_thinking_list.append(f"{header}\n\n{v.get('thinking')}")
-            vision_data = {"issues": vision_issues}
-            if vision_thinking_list:
-                vision_thinking = "\n".join(vision_thinking_list)
+            vision_data = vision_out.get("parsed", {"issues": []})
+            vision_thinking = vision_out.get("thinking", "")
 
-        norm_data = _parse(norm_res)
-        logic_data = _parse(logic_res)
-        table_caption_issues = _collect_table_caption_issues(reader.root)
-        norm_issues = norm_data.get("issues", [])
-        if not isinstance(norm_issues, list):
-            norm_issues = []
-        norm_issues.extend(table_caption_issues)
-        norm_data["issues"] = norm_issues
+        norm_data = norm_out.get("parsed") or _parse(norm_res)
+        logic_data = logic_out.get("parsed") or _parse(logic_res)
 
         final_result = {
             "doc_id": doc_id,
-            "normative_thinking": norm_res.get("thinking", ""),
-            "logic_thinking": logic_res.get("thinking", ""),
+            "normative_thinking": norm_out.get("thinking", ""),
+            "logic_thinking": logic_out.get("thinking", ""),
             "vision_thinking": vision_thinking,
             "issues": [],
         }
-        final_result["issues"].extend(norm_data.get("issues", []))
-        final_result["issues"].extend(logic_data.get("issues", []))
         final_result["issues"].extend(vision_data.get("issues", []))
 
         result_file = Path(args.save_dir) / f"review_{doc_id}.json"
@@ -278,25 +257,23 @@ def main():
         except Exception as e:
             print(f"[Warning] Failed to save outline: {e}")
 
-        # 1. 规范性审查
-        print(f"[Agent] [Normative] Starting...")
-        norm_res = agent.run_normative_review()
+        # 1. 规范性审查 - 已禁用
+        norm_out = {"parsed": {"issues": []}, "thinking": ""}
+        norm_res = {"raw": "", "thinking": ""}
 
-        # 2. 逻辑审查 (Map-Reduce 层次化)
-        print(f"[Agent] [Logic] Starting...")
-        logic_res = agent.run_hierarchical_logic_review()
+        # 2. 逻辑审查 (Map-Reduce 层次化) - 已禁用
+        logic_out = {"parsed": {"issues": []}, "thinking": ""}
+        logic_res = {"raw": "", "thinking": ""}
 
-        # 3. 视觉审查
-        print(f"[Agent] [Vision] Starting...")
-        vision_res = agent.run_vision_review(
+        # 3. 视觉审查 - 已启用
+        print("[Agent] [Vision] Starting...")
+        vision_agent = VisionAgent(agent)
+        vision_out = vision_agent.run(
             vision_model_id=args.vision_model,
             vision_api_key=args.vision_api_key,
             vision_base_url=args.vision_base_url,
             include_page_image=True,  # 启用三页窗口辅助定位
         )
-
-        if logic_res.get("thinking"):
-            print(f"\n[Thinking - Logic]:\n{logic_res['thinking']}")
 
         def _parse(res):
             content = res.get("raw", "")
@@ -326,72 +303,25 @@ def main():
                 )
                 return {"issues": [], "error": "parse_failed"}
 
-        norm_data = _parse(norm_res)
-        logic_data = _parse(logic_res)
-        table_caption_issues = _collect_table_caption_issues(reader.root)
-        norm_issues = norm_data.get("issues", [])
-        if not isinstance(norm_issues, list):
-            norm_issues = []
-        norm_issues.extend(table_caption_issues)
-        norm_data["issues"] = norm_issues
+        norm_data = norm_out.get("parsed") or _parse(norm_res)
+        logic_data = logic_out.get("parsed") or _parse(logic_res)
 
         # 调试信息
         print(f"[Debug] Normative issues count: {len(norm_data.get('issues', []))}")
         print(f"[Debug] Logic issues count: {len(logic_data.get('issues', []))}")
 
-        vision_issues = []
-        vision_thinking_list = []
-        for v in vision_res:
-            if "error" in v:
-                continue
-
-            # Debug: 标记是哪个图片的JSON解析
-            img_id = v.get("image_id", "unknown")
-            print(f"[Debug] Parsing vision result for image {img_id}")
-
-            v_data = _parse(v)
-            v_issues = v_data.get("issues", [])
-
-            # 健壮性检查：确保 v_issues 是列表且包含字典
-            if not isinstance(v_issues, list):
-                print(
-                    f"[Warning] Vision issues is not a list for image {v.get('image_id')}: {type(v_issues)}"
-                )
-                continue
-
-            # 补全页码
-            for idx, iss in enumerate(v_issues):
-                # 确保 iss 是字典
-                if not isinstance(iss, dict):
-                    print(
-                        f"[Warning] Skipping non-dict issue for image {img_id}, index {idx}: {type(iss)}, value={str(iss)[:100]}"
-                    )
-                    continue
-                if not iss.get("page"):
-                    iss["page"] = v.get("page")
-
-            # 只添加有效的字典类型 issue
-            valid_issues = [iss for iss in v_issues if isinstance(iss, dict)]
-            vision_issues.extend(valid_issues)
-
-            if v.get("thinking"):
-                # 将图片 ID 和页码加入 thinking 展示，使用统一标题格式
-                header = f"### 🖼️ 图片分析: {v.get('image_id')} (第 {v.get('page')} 页)"
-                vision_thinking_list.append(f"{header}\n\n{v.get('thinking')}")
-
-        vision_thinking_str = "\n\n".join(vision_thinking_list)
+        vision_issues = vision_out.get("parsed", {}).get("issues", [])
+        vision_thinking_str = vision_out.get("thinking", "")
 
         merged = {
             "doc_id": doc_id,
-            "normative_thinking": norm_res.get("thinking"),
-            "logic_thinking": logic_res.get("thinking"),
+            "normative_thinking": norm_out.get("thinking"),
+            "logic_thinking": logic_out.get("thinking"),
             "vision_thinking": vision_thinking_str,
             "normative_issues": norm_data.get("issues", []),
             "logic_issues": logic_data.get("issues", []),
             "vision_issues": vision_issues,
-            "issues": norm_data.get("issues", [])
-            + logic_data.get("issues", [])
-            + vision_issues,
+            "issues": vision_issues,
         }
 
         out_path = Path(args.save_dir) / f"review_{doc_id}.json"

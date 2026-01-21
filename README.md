@@ -28,6 +28,7 @@ DEEPSEEK_API_KEY=your_deepseek_api_key
 ### Data Pre-Processing
 Prerequisite: Obtain free Adobe PDF Service Client ID and Secret from [here](https://acrobatservices.adobe.com/dc-integration-creation-app-cdn/main.html?api=pdf-services-api).
 
+#### Option 1: General Preprocessing Pipeline
 The preprocessing pipeline consists of 4 steps:
 ```bash
 cd preprocess
@@ -47,6 +48,28 @@ python 3_make_page_images.py --raw-data-dir ../data/ --save-dir ./processed_outp
 # Step 4: Build XML Tree Structure
 # Construct hierarchical XML tree from processed data for agent review
 python 4_build_xml_tree.py --processed-dir ./processed_output/ --output-dir ../sample_results/
+```
+
+#### Option 2: Preprocessing for bylw-pgy Dataset
+
+##### Method 1: Automated Pipeline Script (Windows PowerShell)
+```powershell
+.\scripts\run_pipeline.ps1 -DocName "bylw-pgy"
+```
+
+##### Method 2: Step-by-Step Execution
+```bash
+# Step 1: PDF Content Extraction (MinerU API)
+python preprocess/1_run_pdf_extract.py --raw-data-dir ./data --result-dir preprocess/extract_output --doc-id bylw-pgy
+
+# Step 2: Data Processing and Format Conversion
+python preprocess/2_process_extracted_data.py --extract-data-dir preprocess/extract_output/MinerU --save-dir preprocess/processed_output/MinerU --doc-id bylw-pgy
+
+# Step 3: Generate Page Images (Optional)
+python preprocess/3_make_page_images.py --raw-data-dir ./data/bylw-pgy --save-dir preprocess/processed_output/MinerU --resolution 144
+
+# Step 4: Build XML Tree Structure
+python preprocess/4_build_xml_tree.py --processed-dir preprocess/processed_output/MinerU --doc-id bylw-pgy --output-dir sample_results
 ```
 
 ### Run DocAgent
