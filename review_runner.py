@@ -6,13 +6,15 @@ Outputs JSON issues per document.
 import argparse
 import json
 import os
-import re
 from pathlib import Path
+import concurrent.futures
 
 from dotenv import load_dotenv
 
 from agent import doc_agent
 from agent import doc_reader
+from agent.logic_agent import LogicAgent
+from agent.normative_agent import NormativeAgent
 from agent.vision_agent import VisionAgent
 
 
@@ -159,71 +161,66 @@ def main():
             base_url=args.base_url,
         )
 
-        # 1. 规范性审查 - 已禁用
+        # 1/2/3. 三个 Agent 并行执行
         norm_out = {"parsed": {"issues": []}, "thinking": ""}
-        norm_res = {"raw": "", "thinking": ""}
-
-        # 2. 逻辑审查 (Map-Reduce 层次化) - 已禁用
         logic_out = {"parsed": {"issues": []}, "thinking": ""}
-        logic_res = {"raw": "", "thinking": ""}
-
-        def _parse(res):
-            content = res.get("raw", "")
-            try:
-                if not content:
-                    return {"issues": []}
-                json_block = re.search(r"<json>(.*?)</json>", content, flags=re.DOTALL)
-                if json_block:
-                    content = json_block.group(1).strip()
-                cleaned = re.sub(
-                    r"<thinking>.*?</thinking>", "", content, flags=re.DOTALL
-                ).strip()
-                cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned, flags=re.MULTILINE).strip()
-                decoder = json.JSONDecoder()
-                for candidate in [cleaned, content]:
-                    for idx in range(len(candidate)):
-                        if candidate[idx] not in "{[":
-                            continue
-                        try:
-                            parsed, _ = decoder.raw_decode(candidate[idx:])
-                            if "issues" in parsed and not isinstance(parsed["issues"], list):
-                                parsed["issues"] = []
-                            return parsed
-                        except Exception:
-                            continue
-                parsed = json.loads(cleaned)
-                if "issues" in parsed and not isinstance(parsed["issues"], list):
-                    parsed["issues"] = []
-                return parsed
-            except Exception:
-                return {"issues": [], "error": "parse_failed"}
-
-        # 3. 视觉审查 - 已启用
         vision_data = {"issues": []}
         vision_thinking = ""
-        if reader.image_path_dict or reader.table_image_path_dict:
+
+        def _run_norm():
+            norm_agent = NormativeAgent(agent)
+            return norm_agent.run()
+
+        def _run_logic():
+            logic_agent = LogicAgent(agent)
+            return logic_agent.run()
+
+        def _run_vision():
+            if not (reader.image_path_dict or reader.table_image_path_dict):
+                return {"parsed": {"issues": []}, "thinking": ""}
             print("[Agent] [Vision] Starting...")
             vision_agent = VisionAgent(agent)
-            vision_out = vision_agent.run(
+            return vision_agent.run(
                 vision_model_id=args.vision_model,
                 vision_api_key=args.vision_api_key,
                 vision_base_url=args.vision_base_url,
                 include_page_image=True,
             )
-            vision_data = vision_out.get("parsed", {"issues": []})
-            vision_thinking = vision_out.get("thinking", "")
 
-        norm_data = norm_out.get("parsed") or _parse(norm_res)
-        logic_data = logic_out.get("parsed") or _parse(logic_res)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                "norm": executor.submit(_run_norm),
+                "logic": executor.submit(_run_logic),
+                "vision": executor.submit(_run_vision),
+            }
+            for key, fut in futures.items():
+                try:
+                    if key == "norm":
+                        norm_out = fut.result()
+                    elif key == "logic":
+                        logic_out = fut.result()
+                    else:
+                        vision_out = fut.result()
+                        vision_data = vision_out.get("parsed", {"issues": []})
+                        vision_thinking = vision_out.get("thinking", "")
+                except Exception as e:
+                    print(f"[Warning] {key} agent failed: {e}")
+
+        norm_data = norm_out.get("parsed") or {"issues": []}
+        logic_data = logic_out.get("parsed") or {"issues": []}
 
         final_result = {
             "doc_id": doc_id,
             "normative_thinking": norm_out.get("thinking", ""),
             "logic_thinking": logic_out.get("thinking", ""),
             "vision_thinking": vision_thinking,
-            "issues": [],
+            "normative_issues": norm_data.get("issues", []),
+            "logic_issues": logic_data.get("issues", []),
+            "vision_issues": vision_data.get("issues", []),
+            "issues": norm_data.get("issues", [])
+            + logic_data.get("issues", [])
+            + vision_data.get("issues", []),
         }
-        final_result["issues"].extend(vision_data.get("issues", []))
 
         result_file = Path(args.save_dir) / f"review_{doc_id}.json"
         result_file.write_text(
@@ -257,61 +254,55 @@ def main():
         except Exception as e:
             print(f"[Warning] Failed to save outline: {e}")
 
-        # 1. 规范性审查 - 已禁用
+        # 1/2/3. 三个 Agent 并行执行
         norm_out = {"parsed": {"issues": []}, "thinking": ""}
-        norm_res = {"raw": "", "thinking": ""}
-
-        # 2. 逻辑审查 (Map-Reduce 层次化) - 已禁用
         logic_out = {"parsed": {"issues": []}, "thinking": ""}
-        logic_res = {"raw": "", "thinking": ""}
+        vision_issues = []
+        vision_thinking_str = ""
 
-        # 3. 视觉审查 - 已启用
-        print("[Agent] [Vision] Starting...")
-        vision_agent = VisionAgent(agent)
-        vision_out = vision_agent.run(
-            vision_model_id=args.vision_model,
-            vision_api_key=args.vision_api_key,
-            vision_base_url=args.vision_base_url,
-            include_page_image=True,  # 启用三页窗口辅助定位
-        )
+        def _run_norm():
+            norm_agent = NormativeAgent(agent)
+            return norm_agent.run()
 
-        def _parse(res):
-            content = res.get("raw", "")
-            try:
-                json_block = re.search(r"<json>(.*?)</json>", content, flags=re.DOTALL)
-                if json_block:
-                    content = json_block.group(1).strip()
-                content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.MULTILINE).strip()
-                # Find the JSON part
-                start = content.find("{")
-                end = content.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    json_str = content[start : end + 1]
-                    parsed = json.loads(json_str)
-                    # 确保 issues 字段是列表
-                    if "issues" in parsed and not isinstance(parsed["issues"], list):
-                        print(
-                            f"[Warning] 'issues' field is not a list, converting: {type(parsed['issues'])}"
-                        )
-                        parsed["issues"] = []
-                    return parsed
-                return json.loads(content)
-            except Exception as e:
-                print(f"[Warning] JSON parse failed: {str(e)[:100]}")
-                print(
-                    f"[Warning] Content preview: {content[:200] if content else '(empty)'}..."
-                )
-                return {"issues": [], "error": "parse_failed"}
+        def _run_logic():
+            logic_agent = LogicAgent(agent)
+            return logic_agent.run()
 
-        norm_data = norm_out.get("parsed") or _parse(norm_res)
-        logic_data = logic_out.get("parsed") or _parse(logic_res)
+        def _run_vision():
+            print("[Agent] [Vision] Starting...")
+            vision_agent = VisionAgent(agent)
+            return vision_agent.run(
+                vision_model_id=args.vision_model,
+                vision_api_key=args.vision_api_key,
+                vision_base_url=args.vision_base_url,
+                include_page_image=True,  # 启用三页窗口辅助定位
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                "norm": executor.submit(_run_norm),
+                "logic": executor.submit(_run_logic),
+                "vision": executor.submit(_run_vision),
+            }
+            for key, fut in futures.items():
+                try:
+                    if key == "norm":
+                        norm_out = fut.result()
+                    elif key == "logic":
+                        logic_out = fut.result()
+                    else:
+                        vision_out = fut.result()
+                        vision_issues = vision_out.get("parsed", {}).get("issues", [])
+                        vision_thinking_str = vision_out.get("thinking", "")
+                except Exception as e:
+                    print(f"[Warning] {key} agent failed: {e}")
+
+        norm_data = norm_out.get("parsed") or {"issues": []}
+        logic_data = logic_out.get("parsed") or {"issues": []}
 
         # 调试信息
         print(f"[Debug] Normative issues count: {len(norm_data.get('issues', []))}")
         print(f"[Debug] Logic issues count: {len(logic_data.get('issues', []))}")
-
-        vision_issues = vision_out.get("parsed", {}).get("issues", [])
-        vision_thinking_str = vision_out.get("thinking", "")
 
         merged = {
             "doc_id": doc_id,
@@ -321,7 +312,7 @@ def main():
             "normative_issues": norm_data.get("issues", []),
             "logic_issues": logic_data.get("issues", []),
             "vision_issues": vision_issues,
-            "issues": vision_issues,
+            "issues": norm_data.get("issues", []) + logic_data.get("issues", []) + vision_issues,
         }
 
         out_path = Path(args.save_dir) / f"review_{doc_id}.json"

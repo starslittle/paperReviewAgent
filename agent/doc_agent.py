@@ -77,7 +77,7 @@ class DocAgent:
 
         per_page_texts = {}
         for elem in self.doc_reader.root.iter():
-            if elem.tag not in ["Paragraph", "Heading", "Title", "Caption"]:
+            if elem.tag not in ["Paragraph", "Heading", "Title", "Caption", "Header", "Footer"]:
                 continue
             if not elem.text:
                 continue
@@ -146,6 +146,9 @@ class DocAgent:
         filtered = copy.deepcopy(section_root)
         for parent in filtered.iter():
             for child in list(parent):
+                if child.tag in ["Header", "Footer"]:
+                    parent.remove(child)
+                    continue
                 if child.tag not in ["Paragraph", "Heading", "Title", "Caption"]:
                     continue
                 if not child.text:
@@ -159,7 +162,7 @@ class DocAgent:
         """Extract plain text segments for lightweight review."""
         texts = []
         for elem in self.doc_reader.root.iter():
-            if elem.text and elem.tag in ["Paragraph", "Title", "Caption"]:
+            if elem.text and elem.tag in ["Paragraph", "Title", "Caption", "Header", "Footer"]:
                 t = elem.text.strip()
                 if t and not self._is_header_footer(t, elem.get("page_num")):
                     texts.append(t)
@@ -211,6 +214,10 @@ class DocAgent:
             if json_block:
                 raw_content = json_block.group(1).strip()
 
+            # 兜底处理：存在未闭合的 <thinking> 时，直接截断
+            if "<thinking>" in raw_content and "</thinking>" not in raw_content:
+                raw_content = raw_content.split("<thinking>", 1)[0].strip()
+
             # 移除 <thinking> 标签
             cleaned = re.sub(
                 r"<thinking>.*?</thinking>", "", raw_content, flags=re.DOTALL
@@ -222,6 +229,10 @@ class DocAgent:
             ).strip()
 
             if not cleaned:
+                return {"issues": []}
+
+            # 若没有任何 JSON 起始符号，直接返回空结果
+            if "{" not in cleaned and "[" not in cleaned:
                 return {"issues": []}
 
             # 尝试修复截断的JSON
@@ -938,40 +949,16 @@ class DocAgent:
                 if isinstance(data, dict) and "is_conflict" in data:
                     return bool(data.get("is_conflict")), data.get("reason", "")
             except Exception as e:
+                error_text = str(e)
+                if "Insufficient Balance" in error_text or "402" in error_text:
+                    print(
+                        "[Fact Conflict Verification] Skipped (insufficient balance for verification)"
+                    )
+                    return False, ""
                 print(f"[Fact Conflict Verification] Failed: {e}")
             return True, ""
 
-        # 1. 检测实体冲突（如"甲方"在不同章节有不同的值）
-        for entity_key, occurrences in self.fact_store["entities"].items():
-            if len(occurrences) > 1:
-                # 检查是否有不同的值
-                unique_values = set(occ["value"] for occ in occurrences if occ["value"])
-                if len(unique_values) > 1:
-                    is_conflict, reason = _verify_entity_conflict(
-                        entity_key, occurrences
-                    )
-                    if not is_conflict:
-                        continue
-                    conflicts.append(
-                        {
-                            "issue_type": "逻辑性-实体冲突",
-                            "severity": "High",
-                            "section": "跨章节",
-                            "page": occurrences[0]["page"],
-                            "quote": f"'{entity_key}' 在不同位置有不同的值：{', '.join(unique_values)}",
-                            "suggestion": (
-                                f"'{entity_key}' 的信息在文档中不一致。"
-                                f"出现位置："
-                                + "; ".join(
-                                    [
-                                        f"{occ['source']}为'{occ['value']}'"
-                                        for occ in occurrences[:3]
-                                    ]
-                                )
-                                + (f"。复核说明：{reason}" if reason else "")
-                            ),
-                        }
-                    )
+        # 1. 检测实体冲突（如"甲方"在不同章节有不同的值）- 已关闭
 
         # 2. 检测数值冲突（如"准确率"在不同章节有明显差异）
         for metric_key, occurrences in self.fact_store["numbers"].items():

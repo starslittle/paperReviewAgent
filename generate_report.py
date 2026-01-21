@@ -12,6 +12,15 @@ def generate_html(json_path, output_path):
     issues = data.get("issues", [])
     doc_id = data.get("doc_id", "Unknown Document")
 
+    def escape_html(text):
+        if not text: return ""
+        return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
+
+    # 预处理思考过程文本，确保不破坏 HTML 结构
+    norm_thinking = escape_html(data.get('normative_thinking', '无思考过程'))
+    logic_thinking = escape_html(data.get('logic_thinking', '无思考过程'))
+    vision_thinking = escape_html(data.get('vision_thinking', '无思考过程'))
+
     # 统计
     high_count = len([i for i in issues if i.get("severity") == "High"])
     medium_count = len([i for i in issues if i.get("severity") == "Medium"])
@@ -184,7 +193,7 @@ def generate_html(json_path, output_path):
                     <span>▼</span>
                 </div>
                 <div id="thinking_norm" class="thinking-content markdown-content">
-                    {data.get('normative_thinking', '无思考过程')}
+                    {norm_thinking}
                 </div>
             </div>
 
@@ -194,7 +203,7 @@ def generate_html(json_path, output_path):
                     <span>▼</span>
                 </div>
                 <div id="thinking_logic" class="thinking-content markdown-content">
-                    {data.get('logic_thinking', '无思考过程')}
+                    {logic_thinking}
                 </div>
             </div>
 
@@ -204,11 +213,13 @@ def generate_html(json_path, output_path):
                     <span>▼</span>
                 </div>
                 <div id="thinking_vision" class="thinking-content markdown-content">
-                    {data.get('vision_thinking', '无思考过程')}
+                    {vision_thinking}
                 </div>
             </div>
 
-            <h2>📝 详细修改建议</h2>
+            <div style="clear: both; margin-top: 40px; border-top: 2px solid #eee; padding-top: 20px;">
+                <h2>📝 详细修改建议</h2>
+            </div>
     """
 
     # 定义英文到中文的类型映射（兜底用）

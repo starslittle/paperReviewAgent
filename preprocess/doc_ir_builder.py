@@ -658,7 +658,9 @@ class DocIRBuilder:
                     )
 
                 if image_path:
-                    image_path_dict[str(image_count)] = os.path.basename(image_path)
+                    filename = os.path.basename(image_path)
+                    image_path_dict[str(image_count)] = filename
+                    image.set("image_path", filename)
                 else:
                     image_path_dict[str(image_count)] = f"image_{image_count}.png"
 
@@ -776,6 +778,8 @@ class DocIRBuilder:
                         image_id=str(image_count),
                         page_num=str(current_page),
                     )
+                    if figure_image_path:
+                        image.set("image_path", figure_image_path)
                     if figure_alt_text:
                         alt_node = ET.SubElement(image, "Alt_Text")
                         alt_node.text = str(figure_alt_text)
