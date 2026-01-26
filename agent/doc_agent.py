@@ -23,6 +23,8 @@ from .prompts import (
     vision_verify_prompt,
     local_chapter_review_prompt,
     global_logic_review_prompt,
+    vision_description_prompt,
+    text_analysis_prompt,
 )
 
 
@@ -1336,113 +1338,176 @@ class DocAgent:
                 + f"[Error] 全局分析失败：{e}",
             }
 
+    def _extract_vision_description(
+        self, client, vision_model_id, img_id, base64_img, media_type, caption
+    ):
+        """
+        使用Vision模型提取图片的结构化描述。
+
+        Args:
+            client: OpenAI客户端
+            vision_model_id: 视觉模型ID
+            img_id: 图片ID
+            base64_img: 图片的base64编码
+            media_type: 图片媒体类型
+            caption: 图片标题
+
+        Returns:
+            dict: 包含结构化描述的字典，如果失败则返回None
+        """
+        messages = [
+            {"role": "system", "content": vision_description_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"请提取以下图片的结构化描述。\n\n图片标题：{caption}\n\n请按照要求输出JSON格式的结构化描述。",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media_type};base64,{base64_img}"},
+                    },
+                ],
+            },
+        ]
+
+        try:
+            response = client.chat.completions.create(
+                model=vision_model_id,
+                messages=messages,
+                max_tokens=2048,
+                temperature=0.0,
+            )
+            raw_content = response.choices[0].message.content.strip()
+
+            # 解析JSON输出
+            # 移除可能的markdown代码块标记
+            json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_content, re.DOTALL)
+            if json_match:
+                raw_content = json_match.group(1)
+            else:
+                # 尝试直接提取JSON
+                json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
+                if json_match:
+                    raw_content = json_match.group(1)
+
+            description = json.loads(raw_content)
+            return description
+        except Exception as e:
+            print(f"[Vision Description] Failed to extract description for image {img_id}: {e}")
+            return None
+
+    def _analyze_image_text_consistency(
+        self, img_id, vision_description, section_info, caption, context
+    ):
+        """
+        使用Text模型进行深度图文一致性分析。
+
+        Args:
+            img_id: 图片ID
+            vision_description: Vision模型提取的结构化描述
+            section_info: 章节信息字典
+            caption: 图片标题
+            context: 上下文文本
+
+        Returns:
+            dict: 包含分析结果的字典，包括thinking和parsed issues
+        """
+        # 获取章节的完整内容
+        section_elem = section_info.get("section_elem")
+        if section_elem is None:
+            return {"thinking": "无法获取章节内容", "parsed": {"issues": []}}
+
+        # 序列化章节内容为XML字符串
+        import xml.etree.ElementTree as ET
+        section_xml = ET.tostring(section_elem, encoding="unicode", method="xml")
+
+        # 限制内容长度以避免token超限
+        if len(section_xml) > 15000:
+            section_xml = section_xml[:15000] + "\n...(内容过长，已截断)"
+
+        # 构建输入
+        vision_desc_json = json.dumps(vision_description, ensure_ascii=False, indent=2)
+
+        messages = [
+            {"role": "system", "content": text_analysis_prompt},
+            {
+                "role": "user",
+                "content": f"""请分析以下图片的图文一致性：
+
+【视觉模型提取的图片描述】
+{vision_desc_json}
+
+【图片标题】
+{caption}
+
+【上下文片段】
+{context[:500] if len(context) > 500 else context}
+
+【图片所在章节的完整内容】
+{section_xml}
+
+请按照要求进行深度分析，判断：
+1. 图片与标题是否对应
+2. 图片在该章节该位置是否合适
+""",
+            },
+        ]
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_id,
+                messages=messages,
+                max_tokens=4096,
+                temperature=0.0,
+            )
+            raw_content = response.choices[0].message.content
+
+            # 提取thinking
+            thinking = ""
+            thinking_match = re.search(r"<thinking>(.*?)</thinking>", raw_content, re.DOTALL)
+            if thinking_match:
+                thinking = thinking_match.group(1).strip()
+
+            # 解析JSON
+            parsed_issues = []
+            json_match = re.search(r"<json>(.*?)</json>", raw_content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1).strip()
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict):
+                    parsed_issues = parsed.get("issues", [])
+                elif isinstance(parsed, list):
+                    parsed_issues = parsed
+
+            return {
+                "thinking": thinking,
+                "parsed": {"issues": parsed_issues},
+                "raw": raw_content,
+            }
+        except Exception as e:
+            print(f"[Text Analysis] Failed to analyze image {img_id}: {e}")
+            return {
+                "thinking": f"分析失败: {str(e)}",
+                "parsed": {"issues": []},
+            }
+
     def run_vision_review(
         self,
         vision_model_id="qwen3-vl-flash",
         max_images=50,
-        max_tables=20,
         vision_api_key=None,
         vision_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        include_page_image=False,
     ):
         """
-        视觉审查（Vision），遍历文档中的图片进行检查。
+        图文一致性审查（简化版）：
+        1. Vision模型提取图片结构化描述
+        2. Text模型基于完整章节内容分析
+
         输出语言：中文
         """
         results = []
-
-        # 1. 定义中文的 System Prompt，覆盖导入的默认 prompt
-        # 确保包含 <thinking> 标签的要求，以便后续解析
-        vision_system_prompt_cn = """
-    你是一个专业的学术论文视觉审查助手。你的任务是审查论文中的图片及其上下文。
-
-    【核心原则】
-    - 只关注"图片是否支持正文/标题的论述"以及"图片是否适合放在该段落中表达观点"。
-    - 如果图片内容与小标题、正文段落的观点一致且能支撑论述，则视为"无问题"。
-    - 忽略所有与"图文一致性"无关的视觉瑕疵（如清晰度、美观度、水印、边框等）。
-
-    【输入材料】
-    我会提供：
-    1. 【目标图片】（裁剪图）：需要审查的核心对象。
-    2. 【三页连续截图】：前一页、当前页、后一页（按顺序提供）。
-    3. 【文档流文本】：参考信息（可能不准确，仅供参考）。
-
-    【三步审查流程】
-
-    **步骤1：视觉定位（找到图片在哪一页）**
-    - 首先查看【目标图片】的视觉特征（形状、内容、颜色等）
-    - 然后依次浏览三张页面截图，找到【目标图片】出现在哪一页
-    - 记录：图片位于【前一页/当前页/后一页】中的哪一页
-
-    **步骤2：依次解析三页内容（按前→中→后顺序）**
-    对于每一页，提取以下信息：
-    - 是否包含目标图片？
-    - 页面上是否有与该图片相关的Caption（如"图 2-5 XXX"）？
-    - 页面上是否有与该图号相关的正文描述？
-    - 目标图片附近的完整段落（至少一整段），该段落在阐述什么观点？
-
-    **重点**：
-    - Caption通常紧贴图片下方或上方，是小号黑体字
-    - 正文描述可能在图片前后，会引用图号（如"如图2-5所示..."）
-    - Caption和正文描述可能跨页（图在前一页末尾，Caption在当前页开头）
-
-    **步骤3：综合判断图文一致性与段落匹配性**
-    基于你从三页截图中提取的真实信息：
-    - Caption的真实内容是什么？（以截图为准，忽略文档流错误）
-    - 正文对该图的描述是什么？
-    - 图片内容是否与Caption和正文描述一致？
-    - 目标图片放在该段落是否合适：能否清晰支撑该段落的观点/论述？
-
-    【严厉禁止】
-    - 禁止评论图片清晰度、分辨率、字号大小。
-    - 禁止评论图片是否美观、配色是否合理。
-    - 禁止评论水印、Logo、装饰元素。
-    - 如果图片与论文学术内容无关（如装饰/Logo/二维码），直接忽略，issues返回空。
-
-    【输出格式】
-    1. 在 <thinking> 标签中，按照三步流程详细记录你的分析过程：
-       ```
-       【步骤1：定位】
-       目标图片的视觉特征：...
-       在三页中的位置：第X页
-
-       【步骤2：依次解析】
-       前一页（Page N-1）：...
-       当前页（Page N）：看到目标图片，旁边Caption是"图X-X ..."，正文提到...
-       后一页（Page N+1）：...
-
-       【步骤3：综合判断】
-       真实Caption：...
-       图片内容：...
-       与小标题/正文一致性：...
-       与段落观点匹配性：该图是否能准确表达该段观点？是否放置合理？...
-       ```
-
-    2. 在 <thinking> 标签后，输出 <json> 标签包裹的JSON：
-       <json>
-       {
-         "issues": [
-           {
-             "issue_type": "图文一致性",
-             "severity": "High|Medium|Low",
-             "section": "章节名称或null",
-             "page": 图片所在页码（数字，如17）,
-             "image_id": "图片ID或null",
-             "quote": "图题或相关正文片段",
-             "suggestion": "修改建议"
-           }
-         ]
-       }
-       </json>
-
-    3. **重要**：
-       - JSON中不要使用注释（// 或 /* */）
-       - page字段必须是数字，不要写成"Page 17"
-       - 如果没有发现问题，issues为空数组 []
-       - **请务必使用中文进行回复**
-
-    4. **只输出这两个部分**：<thinking>...</thinking> 和 <json>...</json>，不要输出其他任何文本或Markdown标记。
-    """
 
         # Determine client to use
         client = self.client
@@ -1544,49 +1609,6 @@ class DocAgent:
                     "context": context_str,
                 }
 
-        table_info_map = {}
-        for elem in self.doc_reader.root.iter("CSV_Table"):
-            table_id = elem.get("table_id")
-            page_num = elem.get("page_num")
-            context_text = []
-
-            parent = parent_map.get(elem)
-            if parent:
-                try:
-                    children = list(parent)
-                    idx = children.index(elem)
-                    start_idx = max(0, idx - 2)
-                    end_idx = min(len(children), idx + 2)
-                    for i in range(start_idx, end_idx):
-                        node = children[i]
-                        if node.tag == "Paragraph" and node.text:
-                            text = node.text.strip()
-                            if self._is_header_footer(
-                                text, node.get("page_num") or page_num
-                            ):
-                                continue
-                            context_text.append(text)
-                        elif node.tag == "Heading" and node.text:
-                            heading_text = node.text.strip()
-                            if self._is_header_footer(
-                                heading_text, node.get("page_num") or page_num
-                            ):
-                                continue
-                            context_text.append(f"[Heading: {heading_text}]")
-                except ValueError:
-                    pass
-
-            caption_text = (elem.text or "").strip()
-            if len(caption_text) > 120:
-                caption_text = caption_text[:120] + "..."
-
-            if table_id:
-                table_info_map[str(table_id)] = {
-                    "page_num": page_num,
-                    "caption": caption_text,
-                    "context": "\n".join(context_text),
-                }
-
         # Process images
         count = 0
         total_images = len(self.doc_reader.image_path_dict)
@@ -1609,290 +1631,90 @@ class DocAgent:
             )
 
             print(
-                f"[Agent] [Vision] Reviewing image {img_id} (Page {meta['page_num']}): {meta['caption'][:30]}..."
+                f"[Agent] [Vision+Text] Analyzing image {img_id} (Page {meta['page_num']}): {meta['caption'][:30]}..."
             )
 
-            # Optionally attach the full page image to help the model see captions/footers
-            # New Strategy: Attach Previous Page, Current Page, Next Page to handle cross-page captions
-            page_image_block = []
-            if include_page_image and str(meta["page_num"]).isdigit():
-                current_page = int(float(meta["page_num"]))
-                # Fetch Previous, Current, Next pages
-                pages_to_fetch = [current_page - 1, current_page, current_page + 1]
-                page_labels = ["前一页", "当前页", "后一页"]
-
-                for idx, p_num in enumerate(pages_to_fetch):
-                    if p_num < 1 or p_num > self.doc_reader.num_page:
-                        continue
-                    try:
-                        page_media_type, page_base64_img, page_err = (
-                            self.doc_reader.get_page_image(p_num)
-                        )
-                        if not page_err:
-                            # 明确标注页面顺序：前一页、当前页、后一页
-                            label = (
-                                page_labels[idx]
-                                if idx < len(page_labels)
-                                else f"Page {p_num}"
-                            )
-                            page_image_block.append(
-                                {
-                                    "type": "text",
-                                    "text": f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n【{label}：Page {p_num}】\n请仔细查看本页是否包含目标图片，以及是否有相关的Caption或正文描述。\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                                }
-                            )
-                            page_image_block.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:{page_media_type};base64,{page_base64_img}"
-                                    },
-                                }
-                            )
-                    except Exception as e:
-                        print(
-                            f"[Agent] [Vision] Failed to attach page image for page {p_num}: {e}"
-                        )
-
-            # Construct message for Vision Model
-            messages = [
-                {"role": "system", "content": vision_system_prompt_cn},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 【图文一致性审查任务】
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📎 **文档流参考信息**（可能不准确，仅供参考）：
-- 图片ID: {img_id}
-- 预估页码: {meta['page_num']}
-- 提取的Caption: {meta['caption']}
-- 上下文片段: {meta['context'][:150]}{'...' if len(meta['context']) > 150 else ''}
-
-⚠️ **警告**：上述信息由PDF解析器提取，可能存在图号混乱、Caption错误、context混入其他图片描述等问题。
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 **请严格按照三步流程进行审查**：
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-**第1步：视觉定位**
-- 下方第一张图是【目标图片】，记住它的视觉特征
-- 在后续的三张页面截图中，找到该图片出现在哪一页
-
-**第2步：依次解析三页内容（重要！）**
-按照【前一页 → 当前页 → 后一页】的顺序，逐页提取：
-- 该页是否包含目标图片？
-- 是否有Caption（如"图 2-5 Focus结构"）？
-- 是否有正文描述（如"如图2-5所示..."）？
-
-**第3步：综合判断**
-- 汇总从三页中提取的真实Caption和描述
-- 判断图片内容是否与Caption、正文一致
-- 以你从页面截图中看到的为准，而不是文档流信息
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👇 **下方是目标图片和三页连续截图**
-
-【目标图片】：""",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{base64_img}"
-                            },
-                        },
-                    ]
-                    + page_image_block,
-                },
-            ]
-
             try:
-                response = client.chat.completions.create(
-                    model=vision_model_id,
-                    messages=messages,
-                    max_tokens=4096,  # 进一步增加token限制，确保完整输出
-                    temperature=0.0,  # 降低温度确保视觉审查结果稳定
+                # 步骤1: Vision模型提取结构化描述
+                print(f"[Step 1/2] Extracting vision description for image {img_id}...")
+                vision_description = self._extract_vision_description(
+                    client=client,
+                    vision_model_id=vision_model_id,
+                    img_id=img_id,
+                    base64_img=base64_img,
+                    media_type=media_type,
+                    caption=meta["caption"],
                 )
-                raw_content = response.choices[0].message.content
 
-                # Debug: 如果是image 7，显示完整输出
-                if img_id == "7":
-                    print(f"[Debug] Image 7 raw output:\n{raw_content}\n")
+                if vision_description:
+                    print(f"[Step 1/2] ✓ Vision description extracted")
 
-                # Extract thinking and json
-                thinking = ""
-                thinking_match = re.search(
-                    r"<thinking>(.*?)</thinking>", raw_content, re.DOTALL
-                )
-                if thinking_match:
-                    thinking = thinking_match.group(1).strip()
+                    # 步骤2: 根据页码查找所属章节
+                    section_info = self.doc_reader.find_section_by_page(meta["page_num"])
 
-                results.append(
-                    {
-                        "image_id": img_id,
-                        "page": meta["page_num"],
-                        "caption": meta["caption"],
-                        "raw": raw_content,
-                        "thinking": thinking,
-                    }
-                )
+                    if section_info:
+                        print(f"[Step 2/2] Found section: {section_info['title']}")
+
+                        # 步骤3: Text模型进行深度分析
+                        text_analysis = self._analyze_image_text_consistency(
+                            img_id=img_id,
+                            vision_description=vision_description,
+                            section_info=section_info,
+                            caption=meta["caption"],
+                            context=meta["context"],
+                        )
+
+                        # 合并结果
+                        thinking = f"""### 📸 Vision结构化描述
+{json.dumps(vision_description, ensure_ascii=False, indent=2)}
+
+### 📝 Text模型深度分析
+{text_analysis.get('thinking', '')}
+
+📍 所属章节: {section_info['title']}
+"""
+
+                        results.append(
+                            {
+                                "image_id": img_id,
+                                "page": meta["page_num"],
+                                "caption": meta["caption"],
+                                "raw": json.dumps(vision_description, ensure_ascii=False),
+                                "thinking": thinking,
+                                "vision_description": vision_description,
+                                "text_analysis": text_analysis.get("parsed", {"issues": []}),
+                                "section": section_info["title"],
+                            }
+                        )
+                    else:
+                        print(f"[Warning] Section not found for page {meta['page_num']}, skipping image {img_id}")
+                        results.append(
+                            {
+                                "image_id": img_id,
+                                "page": meta["page_num"],
+                                "caption": meta["caption"],
+                                "error": "Section not found",
+                            }
+                        )
+                else:
+                    print(f"[Warning] Vision description failed for image {img_id}, skipping")
+                    results.append(
+                        {
+                            "image_id": img_id,
+                            "page": meta["page_num"],
+                            "caption": meta["caption"],
+                            "error": "Vision description extraction failed",
+                        }
+                    )
+
                 count += 1
 
             except Exception as e:
-                print(f"Vision review failed for image {img_id}: {e}")
+                print(f"[Error] Analysis failed for image {img_id}: {e}")
                 results.append({"image_id": img_id, "error": str(e)})
 
-        table_count = 0
-        total_tables = len(self.doc_reader.table_image_path_dict)
-        process_table_limit = min(max_tables, total_tables)
-        if total_tables:
-            print(
-                f"[Agent] Found {total_tables} tables, will review first {process_table_limit} tables."
-            )
-
-        for table_id in self.doc_reader.table_image_path_dict.keys():
-            if table_count >= max_tables:
-                break
-
-            media_type, base64_img, error = self.doc_reader.get_table_image(table_id)
-            if error:
-                print(f"Error loading table {table_id}: {error}")
-                continue
-
-            meta = table_info_map.get(
-                table_id, {"page_num": "?", "caption": "表格", "context": ""}
-            )
-
-            print(
-                f"[Agent] [Vision] Reviewing table {table_id} (Page {meta['page_num']}): {meta['caption'][:30]}..."
-            )
-
-            page_image_block = []
-            if include_page_image and str(meta["page_num"]).isdigit():
-                current_page = int(float(meta["page_num"]))
-                pages_to_fetch = [current_page - 1, current_page, current_page + 1]
-                page_labels = ["前一页", "当前页", "后一页"]
-
-                for idx, p_num in enumerate(pages_to_fetch):
-                    if p_num < 1 or p_num > self.doc_reader.num_page:
-                        continue
-                    try:
-                        page_media_type, page_base64_img, page_err = (
-                            self.doc_reader.get_page_image(p_num)
-                        )
-                        if not page_err:
-                            label = (
-                                page_labels[idx]
-                                if idx < len(page_labels)
-                                else f"Page {p_num}"
-                            )
-                            page_image_block.append(
-                                {
-                                    "type": "text",
-                                    "text": f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n【{label}：Page {p_num}】\n请仔细查看本页是否包含目标表格，以及是否有相关的Caption或正文描述。\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                                }
-                            )
-                            page_image_block.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:{page_media_type};base64,{page_base64_img}"
-                                    },
-                                }
-                            )
-                    except Exception as e:
-                        print(
-                            f"[Agent] [Vision] Failed to attach page image for page {p_num}: {e}"
-                        )
-
-            messages = [
-                {"role": "system", "content": vision_system_prompt_cn},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 【图文一致性审查任务】(表格)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📎 **文档流参考信息**（可能不准确，仅供参考）：
-- 表格ID: {table_id}
-- 预估页码: {meta['page_num']}
-- 提取的表格内容: {meta['caption']}
-- 上下文片段: {meta['context'][:150]}{'...' if len(meta['context']) > 150 else ''}
-
-⚠️ **警告**：上述信息由PDF解析器提取，可能存在图号混乱、Caption错误、context混入其他图片描述等问题。
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🎯 **请严格按照三步流程进行审查**：
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-**第1步：视觉定位**
-- 下方第一张图是【目标表格截图】，记住它的视觉特征
-- 在后续的三张页面截图中，找到该表格出现在哪一页
-
-**第2步：依次解析三页内容（重要！）**
-按照【前一页 → 当前页 → 后一页】的顺序，逐页提取：
-- 该页是否包含目标表格？
-- 是否有Caption（如"表 2-1 XXX"）？
-- 是否有正文描述（如"如表2-1所示..."）？
-
-**第3步：综合判断**
-- 汇总从三页中提取的真实Caption和描述
-- 判断表格内容是否与Caption、正文一致
-- 以你从页面截图中看到的为准，而不是文档流信息
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-👇 **下方是目标表格和三页连续截图**
-
-【目标表格】：""",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{base64_img}"
-                            },
-                        },
-                    ]
-                    + page_image_block,
-                },
-            ]
-
-            try:
-                response = client.chat.completions.create(
-                    model=vision_model_id,
-                    messages=messages,
-                    max_tokens=4096,  # 表格也需要足够的token
-                    temperature=0.0,
-                )
-                raw_content = response.choices[0].message.content
-                thinking = ""
-                thinking_match = re.search(
-                    r"<thinking>(.*?)</thinking>", raw_content, re.DOTALL
-                )
-                if thinking_match:
-                    thinking = thinking_match.group(1).strip()
-
-                results.append(
-                    {
-                        "image_id": f"table_{table_id}",
-                        "page": meta["page_num"],
-                        "caption": meta["caption"],
-                        "raw": raw_content,
-                        "thinking": thinking,
-                    }
-                )
-                table_count += 1
-            except Exception as e:
-                print(f"Vision review failed for table {table_id}: {e}")
-                results.append({"image_id": f"table_{table_id}", "error": str(e)})
-
+        # 返回结果
+        print(f"\n[Agent] ✅ Completed analysis of {count} images")
         return results
 
     def run_normative_logic_review(self):

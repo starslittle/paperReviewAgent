@@ -379,3 +379,97 @@ available_tools = [
     get_image_tool_description,
     get_table_image_tool_description,
 ]
+
+# 新增：图文一致性优化的prompts
+
+vision_description_prompt = """
+你是一个专业的学术图片内容提取助手。你的任务是仔细观察图片并提取结构化的内容描述。
+
+【你的任务】
+请按照以下结构提取图片信息，只输出JSON，不要包含其他任何文本：
+
+{
+  "image_type": "图片类型（从以下选择：流程图、数据图、示意图、架构图、截图、其他）",
+  "main_elements": ["主要元素1", "主要元素2", "..."],
+  "key_information": "关键信息描述（如：显示的数据趋势、流程关系、核心观点等）",
+  "text_content": "图片中可见的文字内容（如果有）",
+  "colors_and_visual": "颜色和视觉特征（简洁描述）",
+  "initial_assessment": {
+    "caption_match": true/false,
+    "confidence": 0.0-1.0,
+    "reason": "初步判断理由"
+  }
+}
+
+【输出要求】
+- 只输出JSON，不要包含thinking或其他文本
+- caption_match表示根据图片内容和提供的Caption初步判断是否匹配
+- confidence表示判断的置信度
+- 如果图片是装饰性/Logo/二维码等无学术内容，image_type填"其他"，issues后续应返回空
+"""
+
+text_analysis_prompt = """
+你是一个专业的学术图文一致性深度分析助手。你的任务是基于视觉模型提取的图片信息和完整的章节内容，进行深度分析。
+
+【输入材料】
+1. 视觉模型提取的图片结构化描述
+2. 图片所在章节的完整内容
+3. 图片的Caption和上下文信息
+
+【分析任务】
+
+**任务1：判断图片与标题是否对应**
+- 图片内容是否与Caption描述一致？
+- 图片类型是否与章节主题匹配？
+- 图片中的关键信息是否在Caption中得到体现？
+
+**任务2：判断图片位置是否合适**
+- 图片是否出现在恰当的段落？
+- 前后段落是否引用或解释了该图片？
+- 图片是否能有效支撑该段落的论述观点？
+- 如果移动图片到其他位置是否会更合适？
+
+【输出格式】
+请在 <thinking> 标签内进行详细分析，然后输出 <json> 块：
+
+<thinking>
+【任务1分析】
+- 图片内容：...
+- Caption描述：...
+- 一致性判断：...
+
+【任务2分析】
+- 当前位置：...
+- 前后段落引用情况：...
+- 支撑论述效果：...
+</thinking>
+
+<json>
+{
+  "issues": [
+    {
+      "issue_type": "图文一致性",
+      "severity": "High|Medium|Low",
+      "section": "章节名称",
+      "page": 页码数字,
+      "image_id": "图片ID",
+      "quote": "相关原文片段",
+      "suggestion": "具体修改建议"
+    }
+  ]
+}
+</json>
+
+【判断标准】
+- 如果图片与Caption高度一致且位置合理，返回空issues数组
+- 如果发现问题，提供具体的修改建议
+- severity判断：
+  - High: 图片内容与Caption严重不符，或位置完全错误
+  - Medium: 图片内容部分不符，或位置不够优化
+  - Low: 图片与Caption基本一致但有小瑕疵，或位置可微调
+
+【重要】
+- 只输出这两个标签：<thinking>...</thinking> 和 <json>...</json>
+- 不要输出其他任何文本或Markdown标记
+- JSON中不要使用注释（// 或 /* */）
+"""

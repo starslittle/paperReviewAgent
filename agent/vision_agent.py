@@ -28,18 +28,36 @@ class VisionAgent:
             if not isinstance(res, dict) or "error" in res:
                 continue
             raw = res.get("raw", "")
-            parsed = self.doc_agent._parse_json(raw) if raw else {"issues": []}
-            if isinstance(parsed, list):
-                parsed_issues = parsed
-            elif isinstance(parsed, dict):
-                parsed_issues = parsed.get("issues", [])
+
+            # 处理增强流程的text_analysis结果
+            if "text_analysis" in res and res["text_analysis"]:
+                text_issues = res["text_analysis"].get("issues", [])
+                if isinstance(text_issues, list):
+                    for iss in text_issues:
+                        if isinstance(iss, dict):
+                            # 确保page和image_id正确填充
+                            if not iss.get("page"):
+                                iss["page"] = res.get("page")
+                            if not iss.get("image_id"):
+                                iss["image_id"] = res.get("image_id")
+                            if not iss.get("section"):
+                                iss["section"] = res.get("section")
+                    issues.extend([iss for iss in text_issues if isinstance(iss, dict)])
             else:
-                parsed_issues = []
-            if isinstance(parsed_issues, list):
-                for iss in parsed_issues:
-                    if isinstance(iss, dict) and not iss.get("page"):
-                        iss["page"] = res.get("page")
-                issues.extend([iss for iss in parsed_issues if isinstance(iss, dict)])
+                # 原始流程：解析raw content
+                parsed = self.doc_agent._parse_json(raw) if raw else {"issues": []}
+                if isinstance(parsed, list):
+                    parsed_issues = parsed
+                elif isinstance(parsed, dict):
+                    parsed_issues = parsed.get("issues", [])
+                else:
+                    parsed_issues = []
+                if isinstance(parsed_issues, list):
+                    for iss in parsed_issues:
+                        if isinstance(iss, dict) and not iss.get("page"):
+                            iss["page"] = res.get("page")
+                    issues.extend([iss for iss in parsed_issues if isinstance(iss, dict)])
+
             if res.get("thinking"):
                 header = (
                     f"### 🖼️ 图片分析: {res.get('image_id', 'unknown')} "

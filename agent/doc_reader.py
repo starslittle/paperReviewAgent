@@ -157,6 +157,67 @@ class DocReader:
     def get_section_content(self, section_id):
         return self.section_dict[section_id]
 
+    def find_section_by_page(self, page_num):
+        """
+        根据页码查找所属章节。
+
+        Args:
+            page_num: 页码（整数）
+
+        Returns:
+            dict: 包含 section_id, title, start_page_num, end_page_num 的字典，如果找不到则返回 None
+        """
+        page_int = int(float(page_num))
+
+        best_section = None
+        best_section_id = None
+        smallest_range = float('inf')
+
+        for section_id, section_elem in self.section_dict.items():
+            start_page = section_elem.get("start_page_num")
+            end_page = section_elem.get("end_page_num")
+
+            if start_page is not None:
+                try:
+                    start_int = int(float(start_page))
+                    # 如果有end_page，检查是否在范围内
+                    if end_page is not None:
+                        end_int = int(float(end_page))
+                        if start_int <= page_int <= end_int:
+                            # 计算章节范围，选择范围最小的（最精确的匹配）
+                            page_range = end_int - start_int
+                            if page_range < smallest_range:
+                                smallest_range = page_range
+                                best_section = section_elem
+                                best_section_id = section_id
+                    else:
+                        # 如果没有end_page，只检查start_page
+                        if start_int <= page_int:
+                            # 对于没有end_page的章节，选择start_page最大的（最接近的）
+                            if best_section is None or start_int > int(float(best_section.get("start_page_num", 0))):
+                                best_section = section_elem
+                                best_section_id = section_id
+                except (ValueError, TypeError):
+                    continue
+
+        if best_section is None:
+            return None
+
+        # 提取章节标题
+        title_text = "Unknown Section"
+        for node in best_section:
+            if node.tag == "Heading" and node.text:
+                title_text = node.text
+                break
+
+        return {
+            "section_id": best_section_id,
+            "title": title_text,
+            "start_page_num": best_section.get("start_page_num"),
+            "end_page_num": best_section.get("end_page_num"),
+            "section_elem": best_section
+        }
+
     def get_chapters(self):
         """
         Splits the document into chapters based on top-level sections (Heading 1).
