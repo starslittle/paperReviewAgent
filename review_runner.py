@@ -49,14 +49,14 @@ def parse_args():
     parser.add_argument(
         "--api-key",
         type=str,
-        default=os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY"),
-        help="API key (env DEEPSEEK_API_KEY/OPENAI_API_KEY)",
+        default=os.getenv("DASHSCOPE_API_KEY"),
+        help="API key for text model (env DASHSCOPE_API_KEY)",
     )
     parser.add_argument(
         "--base-url",
         type=str,
-        default=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        help="Base URL for the API",
+        default=os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        help="Base URL for text model API",
     )
     parser.add_argument(
         "--vision-model",
@@ -76,6 +76,20 @@ def parse_args():
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
         help="Base URL for vision model",
     )
+    # 已废弃：不再支持并行模式，只使用串行结构化流程
+    # parser.add_argument(
+    #     "--no-parallel",
+    #     dest="parallel",
+    #     action="store_false",
+    #     default=True,
+    #     help="Disable parallel processing (use serial mode). Default: parallel mode enabled.",
+    # )
+    # parser.add_argument(
+    #     "--max-workers",
+    #     type=int,
+    #     default=3,
+    #     help="Number of parallel workers for vision review (default: 3)",
+    # )
     return parser.parse_args()
 
 
@@ -156,70 +170,38 @@ def main():
         )
         agent = doc_agent.DocAgent(
             reader,
-            model_id="deepseek-chat",
+            model_id="deepseek-v3.2",
             api_key=args.api_key,
             base_url=args.base_url,
         )
 
-        # 1/2/3. 三个 Agent 并行执行
-        norm_out = {"parsed": {"issues": []}, "thinking": ""}
-        logic_out = {"parsed": {"issues": []}, "thinking": ""}
-        vision_data = {"issues": []}
-        vision_thinking = ""
-
-        def _run_norm():
-            norm_agent = NormativeAgent(agent)
-            return norm_agent.run()
-
-        def _run_logic():
-            logic_agent = LogicAgent(agent)
-            return logic_agent.run()
-
-        def _run_vision():
-            if not (reader.image_path_dict or reader.table_image_path_dict):
-                return {"parsed": {"issues": []}, "thinking": ""}
+        # 仅运行 Vision Agent (其他agent已禁用用于测试)
+        if not (reader.image_path_dict or reader.table_image_path_dict):
+            vision_data = {"issues": []}
+            vision_thinking = ""
+        else:
             print("[Agent] [Vision] Starting...")
             vision_agent = VisionAgent(agent)
-            return vision_agent.run(
+            vision_out = vision_agent.run(
                 vision_model_id=args.vision_model,
                 vision_api_key=args.vision_api_key,
                 vision_base_url=args.vision_base_url,
                 include_page_image=True,
+                parallel=None,  # 已废弃，不再使用并行模式
+                max_workers=None,  # 已废弃，不再使用并行模式
             )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                "norm": executor.submit(_run_norm),
-                "logic": executor.submit(_run_logic),
-                "vision": executor.submit(_run_vision),
-            }
-            for key, fut in futures.items():
-                try:
-                    if key == "norm":
-                        norm_out = fut.result()
-                    elif key == "logic":
-                        logic_out = fut.result()
-                    else:
-                        vision_out = fut.result()
-                        vision_data = vision_out.get("parsed", {"issues": []})
-                        vision_thinking = vision_out.get("thinking", "")
-                except Exception as e:
-                    print(f"[Warning] {key} agent failed: {e}")
-
-        norm_data = norm_out.get("parsed") or {"issues": []}
-        logic_data = logic_out.get("parsed") or {"issues": []}
+            vision_data = vision_out.get("parsed", {"issues": []})
+            vision_thinking = vision_out.get("thinking", "")
 
         final_result = {
             "doc_id": doc_id,
-            "normative_thinking": norm_out.get("thinking", ""),
-            "logic_thinking": logic_out.get("thinking", ""),
+            "normative_thinking": "",
+            "logic_thinking": "",
             "vision_thinking": vision_thinking,
-            "normative_issues": norm_data.get("issues", []),
-            "logic_issues": logic_data.get("issues", []),
+            "normative_issues": [],
+            "logic_issues": [],
             "vision_issues": vision_data.get("issues", []),
-            "issues": norm_data.get("issues", [])
-            + logic_data.get("issues", [])
-            + vision_data.get("issues", []),
+            "issues": vision_data.get("issues", []),
         }
 
         result_file = Path(args.save_dir) / f"review_{doc_id}.json"
@@ -240,7 +222,7 @@ def main():
         reader = doc_reader.DocReader(data_path=data_path)
         agent = doc_agent.DocAgent(
             reader,
-            model_id="deepseek-chat",
+            model_id="deepseek-v3.2",
             api_key=args.api_key,
             base_url=args.base_url,
         )
@@ -254,65 +236,33 @@ def main():
         except Exception as e:
             print(f"[Warning] Failed to save outline: {e}")
 
-        # 1/2/3. 三个 Agent 并行执行
-        norm_out = {"parsed": {"issues": []}, "thinking": ""}
-        logic_out = {"parsed": {"issues": []}, "thinking": ""}
-        vision_issues = []
-        vision_thinking_str = ""
-
-        def _run_norm():
-            norm_agent = NormativeAgent(agent)
-            return norm_agent.run()
-
-        def _run_logic():
-            logic_agent = LogicAgent(agent)
-            return logic_agent.run()
-
-        def _run_vision():
-            print("[Agent] [Vision] Starting...")
-            vision_agent = VisionAgent(agent)
-            return vision_agent.run(
-                vision_model_id=args.vision_model,
-                vision_api_key=args.vision_api_key,
-                vision_base_url=args.vision_base_url,
-                include_page_image=True,  # 启用三页窗口辅助定位
-            )
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                "norm": executor.submit(_run_norm),
-                "logic": executor.submit(_run_logic),
-                "vision": executor.submit(_run_vision),
-            }
-            for key, fut in futures.items():
-                try:
-                    if key == "norm":
-                        norm_out = fut.result()
-                    elif key == "logic":
-                        logic_out = fut.result()
-                    else:
-                        vision_out = fut.result()
-                        vision_issues = vision_out.get("parsed", {}).get("issues", [])
-                        vision_thinking_str = vision_out.get("thinking", "")
-                except Exception as e:
-                    print(f"[Warning] {key} agent failed: {e}")
-
-        norm_data = norm_out.get("parsed") or {"issues": []}
-        logic_data = logic_out.get("parsed") or {"issues": []}
+        # 仅运行 Vision Agent (其他agent已禁用用于测试)
+        print("[Agent] [Vision] Starting...")
+        vision_agent = VisionAgent(agent)
+        vision_out = vision_agent.run(
+            vision_model_id=args.vision_model,
+            vision_api_key=args.vision_api_key,
+            vision_base_url=args.vision_base_url,
+            include_page_image=True,  # 启用三页窗口辅助定位
+            parallel=None,  # 已废弃，不再使用并行模式
+            max_workers=None,  # 已废弃，不再使用并行模式
+        )
+        
+        vision_issues = vision_out.get("parsed", {}).get("issues", [])
+        vision_thinking_str = vision_out.get("thinking", "")
 
         # 调试信息
-        print(f"[Debug] Normative issues count: {len(norm_data.get('issues', []))}")
-        print(f"[Debug] Logic issues count: {len(logic_data.get('issues', []))}")
+        print(f"[Debug] Vision issues count: {len(vision_issues)}")
 
         merged = {
             "doc_id": doc_id,
-            "normative_thinking": norm_out.get("thinking"),
-            "logic_thinking": logic_out.get("thinking"),
+            "normative_thinking": "",
+            "logic_thinking": "",
             "vision_thinking": vision_thinking_str,
-            "normative_issues": norm_data.get("issues", []),
-            "logic_issues": logic_data.get("issues", []),
+            "normative_issues": [],
+            "logic_issues": [],
             "vision_issues": vision_issues,
-            "issues": norm_data.get("issues", []) + logic_data.get("issues", []) + vision_issues,
+            "issues": vision_issues,
         }
 
         out_path = Path(args.save_dir) / f"review_{doc_id}.json"

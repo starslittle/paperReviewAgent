@@ -259,6 +259,7 @@ def generate_html(json_path, output_path):
             )
             page = issue.get("page", "N/A")
             img_id = issue.get("image_id", "")
+            caption = issue.get("caption", "")
 
             suggestion_short = (
                 issue.get("suggestion", "")[:40] + "..."
@@ -266,9 +267,16 @@ def generate_html(json_path, output_path):
                 else issue.get("suggestion", "")
             )
 
-            title_text = f"[{issue_type}] 第 {page} 页: {suggestion_short}"
+            # 构建标题：如果有caption，显示caption；否则显示图表ID
             if img_id:
-                title_text = f"[图表 {img_id}] " + title_text
+                if caption:
+                    # 截断过长的caption（保留前50字符）
+                    caption_short = caption[:50] + "..." if len(caption) > 50 else caption
+                    title_text = f"[图表 {img_id}: {caption_short}] [{issue_type}] 第 {page} 页: {suggestion_short}"
+                else:
+                    title_text = f"[图表 {img_id}] [{issue_type}] 第 {page} 页: {suggestion_short}"
+            else:
+                title_text = f"[{issue_type}] 第 {page} 页: {suggestion_short}"
 
             html += f"""
                 <div class="issue-card">
@@ -281,6 +289,7 @@ def generate_html(json_path, output_path):
                     </div>
                     <div id="issue_{idx}" class="issue-body">
                         <div class="meta">📍 位置: 第 {page} 页 | 章节: {issue.get('section', '未知')}</div>
+                        {f'<div class="meta" style="margin-top: 8px; color: #666;">📊 图表名称: {escape_html(caption)}</div>' if caption else ''}
                         
                         <div class="quote">
                             <strong>原文片段/描述:</strong><br>

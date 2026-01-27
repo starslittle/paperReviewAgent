@@ -456,6 +456,16 @@ class OutlineOnlyReader:
 
         self.image_count = len(self.image_path_dict)
         self.table_count = len(self.table_image_path_dict)
+        
+        # 调试信息：打印图片映射情况
+        if self.image_count > 0:
+            print(f"[Debug] Found {self.image_count} images, source_dir: {self.image_source_dir}")
+            if self.image_count <= 5:
+                print(f"[Debug] Image mappings: {list(self.image_path_dict.items())}")
+            else:
+                print(f"[Debug] First 3 image mappings: {list(list(self.image_path_dict.items())[:3])}")
+        else:
+            print(f"[Warning] No images found in image_path_dict. Searched directories: {image_candidate_dirs}")
 
     def get_outline_root(self, skip_para_after_page=100, disable_caption_after_page=False):
         root = copy.deepcopy(self.root)
@@ -463,6 +473,70 @@ class OutlineOnlyReader:
 
     def get_section_content(self, section_id):
         return self.section_dict[section_id]
+
+    def find_section_by_page(self, page_num):
+        """
+        根据页码查找所属章节。
+
+        Args:
+            page_num: 页码（整数或字符串）
+
+        Returns:
+            dict: 包含 section_id, title, start_page_num, end_page_num, section_elem 的字典，如果找不到则返回 None
+        """
+        try:
+            page_int = int(float(page_num))
+        except (ValueError, TypeError):
+            return None
+
+        best_section = None
+        best_section_id = None
+        smallest_range = float('inf')
+
+        for section_id, section_elem in self.section_dict.items():
+            start_page = section_elem.get("start_page_num")
+            end_page = section_elem.get("end_page_num")
+
+            if start_page is not None:
+                try:
+                    start_int = int(float(start_page))
+                    # 如果有end_page，检查是否在范围内
+                    if end_page is not None:
+                        end_int = int(float(end_page))
+                        if start_int <= page_int <= end_int:
+                            # 计算章节范围，选择范围最小的（最精确的匹配）
+                            page_range = end_int - start_int
+                            if page_range < smallest_range:
+                                smallest_range = page_range
+                                best_section = section_elem
+                                best_section_id = section_id
+                    else:
+                        # 如果没有end_page，只检查start_page
+                        if start_int <= page_int:
+                            # 对于没有end_page的章节，选择start_page最大的（最接近的）
+                            if best_section is None or start_int > int(float(best_section.get("start_page_num", 0))):
+                                best_section = section_elem
+                                best_section_id = section_id
+                except (ValueError, TypeError):
+                    continue
+
+        if best_section is None:
+            return None
+
+        # 提取章节标题
+        title = best_section_id or "未知章节"
+        for child in best_section:
+            if child.tag == "Heading" and child.text:
+                title = child.text.strip()
+                break
+
+        return {
+            "section_id": best_section_id,
+            "title": title,
+            "start_page_num": best_section.get("start_page_num"),
+            "end_page_num": best_section.get("end_page_num"),
+            "section_elem": best_section,
+        }
 
     def get_chapters(self):
         chapters = []
@@ -486,11 +560,15 @@ class OutlineOnlyReader:
         return chapters
 
     def get_image(self, image_id):
-        if image_id not in self.image_path_dict or not self.image_source_dir:
-            return "", "", "Outline-only reader does not support images"
+        if image_id not in self.image_path_dict:
+            return "", "", f"Image ID '{image_id}' not found in image_path_dict (available: {list(self.image_path_dict.keys())[:10]})"
+        if not self.image_source_dir:
+            return "", "", f"Image source directory not found. Please ensure images directory exists."
         image_path = self.image_path_dict[image_id]
         if not os.path.isabs(image_path):
             image_path = os.path.join(self.image_source_dir, image_path)
+        if not os.path.exists(image_path):
+            return "", "", f"Image file not found: {image_path}"
         return process_image(image_path)
 
     def get_page_image(self, page_num):

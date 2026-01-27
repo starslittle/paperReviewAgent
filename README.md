@@ -22,8 +22,10 @@ Create a `.env` file in the root directory and add your API keys:
 ```env
 ADOBE_CLIENT_ID=your_adobe_client_id
 ADOBE_CLIENT_SECRET=your_adobe_client_secret
-DEEPSEEK_API_KEY=your_deepseek_api_key
+DASHSCOPE_API_KEY=your_dashscope_api_key
 ```
+
+**Note**: Both text model (deepseek-v3.2) and vision model (qwen3-vl-flash) use DASHSCOPE_API_KEY from Alibaba Cloud DashScope.
 
 ### Data Pre-Processing
 Prerequisite: Obtain free Adobe PDF Service Client ID and Secret from [here](https://acrobatservices.adobe.com/dc-integration-creation-app-cdn/main.html?api=pdf-services-api).
@@ -96,6 +98,16 @@ After running DocAgent, results are saved in the `sample_results/` directory:
 - `report_[doc_id].html`: Interactive HTML report for visualization
 - `outline_[doc_id].xml`: Extracted document outline structure
 - `tree_[doc_id].xml`: Complete hierarchical XML tree
+
+#### Generate HTML Report
+To generate an interactive HTML report from review results:
+
+```bash
+# Generate report for a specific document (e.g., bylw-pgy)
+python generate_report.py --doc-id bylw-pgy
+```
+
+The report will be saved as `sample_results/report_bylw-pgy.html` and can be opened in any web browser for interactive visualization of issues, AI thinking process, and detailed recommendations.
 
 ## Troubleshooting
 

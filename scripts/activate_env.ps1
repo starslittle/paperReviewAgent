@@ -1,6 +1,11 @@
 # 激活 DocAgent 虚拟环境
 # 使用方法: .\activate_env.ps1
 
+# 设置 UTF-8 编码以正确显示中文
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+chcp 65001 | Out-Null
+
 Write-Host "激活 DocAgent 虚拟环境..." -ForegroundColor Green
 & ".\.venv\Scripts\activate.ps1"
 
