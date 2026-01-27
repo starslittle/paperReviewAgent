@@ -59,6 +59,16 @@ class DocAgent:
             api_key = os.getenv("DASHSCOPE_API_KEY")
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.tool_call_wait_time = tool_call_wait_time
+        # 用于在逻辑审查过程中暂存每章摘要，供全局阶段直接读取
+        self.logic_memory = []
+
+        # ✅ 新增：跨章节共享的事实存储（用于细粒度冲突检测）
+        self.fact_store = {
+            "entities": {},  # 实体：人名、机构、角色等
+            "numbers": {},  # 数值：指标、参数、统计数据等
+            "dates": {},  # 时间：日期、时间线
+            "claims": [],  # 论断：重要观点和结论
+        }
         self._header_footer_index = None
         self._header_footer_pages = {}
         self._header_footer_regex = re.compile(
@@ -382,149 +392,380 @@ class DocAgent:
                     best_page = page
         return best_page
 
-    def run_logic_review(self):
-        """逻辑审查，不使用工具，返回包含 raw 和 thinking 的字典。"""
-        print("[Agent] Starting Logic Review...")
-        return self._run_simple_review(logic_prompt)
+    def select_top_sections(self, max_sections=8, skip_front_matter=True):
+        """
+        Use LLM to select top-level (or important) sections from Outline XML.
+        Returns a list of section_id strings.
 
-    def run_normative_logic_review(self):
-        """Lightweight normative + logic review without tool calls; returns JSON string."""
+        Args:
+            max_sections: Maximum number of sections to select
+            skip_front_matter: Whether to skip front matter (cover, commitment, etc.)
+        """
         outline_xml = self.get_outline()
-        body_text = self._extract_plain_text()
         messages = [
-            {"role": "system", "content": normative_logic_prompt},
+            {"role": "system", "content": chapter_selection_prompt},
             {
                 "role": "user",
-                "content": f"大纲：\n{outline_xml}\n\n正文片段：\n{body_text}\n\n请按约定输出 JSON。",
+                "content": f'以下是论文大纲（XML）。请只输出最重要的大章节 section_id 列表（最多 {max_sections} 个），跳过封面、诚信承诺等非学术内容，但必须包含目录（非常重要的环节）。从摘要开始选择，用 JSON 数组表示，如 ["5", "7", "8", "9"]（摘要+目录+正文）.\n\n{outline_xml}',
             },
         ]
         try:
-            response = self._call_llm(messages, max_tokens=800, temperature=0.0)
-            return response.choices[0].message.content
+            response = self._call_llm(messages, max_tokens=500, temperature=0.0)
+            raw = response.choices[0].message.content
+            data = self._parse_json(raw)
+            if isinstance(data, list):
+                selected_sections = [str(x) for x in data][:max_sections]
+            elif isinstance(data, dict) and "sections" in data:
+                selected_sections = [str(x) for x in data.get("sections", [])][
+                    :max_sections
+                ]
+            else:
+                selected_sections = []
+
+            # 如果启用了跳过前置内容，则过滤掉前面的非学术部分，但确保包含重要章节
+            if skip_front_matter and selected_sections:
+                # 首先找到目录章节（通常包含"目 录"或"目录"）
+                toc_section = None
+                for child in self.doc_reader.root:
+                    if child.tag == "Section":
+                        section_id = child.get("section_id")
+                        try:
+                            sec_root = self.doc_reader.get_section_content(section_id)
+                            title_text = f"Section {section_id}"
+                            for node in sec_root:
+                                if node.tag in ["Heading", "Title"] and node.text:
+                                    title_text = node.text
+                                    break
+                            if any(
+                                keyword in title_text for keyword in ["目 录", "目录"]
+                            ):
+                                toc_section = section_id
+                                break
+                        except Exception:
+                            continue
+
+                # 过滤掉典型的非学术章节（根据标题特征）
+                filtered_sections = []
+                for sid in selected_sections:
+                    try:
+                        sec_root = self.doc_reader.get_section_content(sid)
+                        title_text = f"Section {sid}"
+                        for node in sec_root:
+                            if node.tag in ["Heading", "Title"] and node.text:
+                                title_text = node.text
+                                break
+
+                        # 跳过封面、诚信承诺等非学术内容，但保留摘要、目录等重要内容
+                        skip_keywords = [
+                            "封面",
+                            "诚信",
+                            "承诺",
+                            "签名",
+                            "杭州電子科技大学",
+                        ]
+                        keep_keywords = ["目 录", "目录", "摘要", "abstract", "摘 要"]
+                        if not any(
+                            keyword in title_text for keyword in skip_keywords
+                        ) or any(keyword in title_text for keyword in keep_keywords):
+                            filtered_sections.append(sid)
+                    except Exception:
+                        continue
+
+                # 确保目录被包含（如果找到了目录章节）
+                if toc_section and toc_section not in filtered_sections:
+                    filtered_sections.insert(0, toc_section)  # 插入到开头
+
+                return filtered_sections[:max_sections]
+
+            return selected_sections
+
         except Exception as e:
-            print(traceback.format_exc())
-            return json.dumps(
-                {"issues": [], "error": f"normative_logic_review_failed: {e}"}
-            )
+            print(f"[SectionSelect] failed: {e}")
 
-    # ==================== 以下方法已移出到各Agent中，保留仅为向后兼容 ====================
-    # 这些方法现在应该通过对应的Agent调用，而不是直接调用DocAgent的方法
-    # ================================================================================
-    
-    def _extract_chapter_facts(self, chapter_content, chapter_info):
-        """
-        【已移出】此方法已移至LogicAgent中
-        """
-        raise NotImplementedError("此方法已移至LogicAgent，请通过LogicAgent调用")
+        # fallback: take top-level section ids from doc_reader, skip front matter but keep important sections
+        top_ids = []
+        toc_section = None
 
-    def _store_facts(self, facts, chapter_info):
-        """
-        【已移出】此方法已移至LogicAgent中
-        """
-        raise NotImplementedError("此方法已移至LogicAgent，请通过LogicAgent调用")
+        # 首先找到目录章节
+        for child in self.doc_reader.root:
+            if child.tag == "Section":
+                section_id = child.get("section_id")
+                try:
+                    title_text = f"Section {section_id}"
+                    for node in child:
+                        if node.tag in ["Heading", "Title"] and node.text:
+                            title_text = node.text
+                            break
+                    if any(keyword in title_text for keyword in ["目 录", "目录"]):
+                        toc_section = section_id
+                        break
+                except Exception:
+                    continue
 
-    def _detect_fact_conflicts(self):
-        """
-        【已移出】此方法已移至LogicAgent中
-        """
-        raise NotImplementedError("此方法已移至LogicAgent，请通过LogicAgent调用")
+        for child in self.doc_reader.root:
+            if child.tag == "Section":
+                section_id = child.get("section_id")
+                if skip_front_matter:
+                    # 基于section_id和内容跳过前面的非学术部分，但保留摘要和目录
+                    try:
+                        sid_int = int(section_id)
+                        if sid_int <= 4:  # 跳过前4个section（封面相关）
+                            # 但要检查是否是摘要、目录等重要内容
+                            title_text = f"Section {section_id}"
+                            for node in child:
+                                if node.tag in ["Heading", "Title"] and node.text:
+                                    title_text = node.text
+                                    break
+                            keep_keywords = [
+                                "目 录",
+                                "目录",
+                                "摘要",
+                                "abstract",
+                                "摘 要",
+                            ]
+                            if not any(
+                                keyword in title_text for keyword in keep_keywords
+                            ):
+                                continue
+                    except (ValueError, TypeError):
+                        pass
+                top_ids.append(section_id)
+            if len(top_ids) >= max_sections:
+                break
 
-    def run_hierarchical_logic_review(self):
-        """
-        【已移出】此方法已移至LogicAgent中
-        """
-        raise NotImplementedError("此方法已移至LogicAgent，请通过LogicAgent调用")
+        # 确保目录被包含在结果中
+        if toc_section and toc_section not in top_ids:
+            top_ids.insert(0, toc_section)  # 插入到开头
 
-    def _build_figure_unit(self, img_id: str, image_info: Dict, base64_img: str, media_type: str) -> Optional[Dict]:
-        """
-        【已移出】此方法已移至VisionAgent中
-        """
-        raise NotImplementedError("此方法已移至VisionAgent，请通过VisionAgent调用")
+        return top_ids[:max_sections]
 
-    def _extract_reference_texts(self, img_id: str, caption: str, section_info: Dict) -> List[str]:
-        """
-        【已移出】此方法已移至VisionAgent中
-        """
-        raise NotImplementedError("此方法已移至VisionAgent，请通过VisionAgent调用")
+    def _needs_vision_verification(self, issue):
+        """Determine if an issue needs vision verification (e.g. missing sections, page numbers)."""
+        suggestion = issue.get("suggestion", "")
+        issue_type = issue.get("issue_type", "")
+        # Keywords that suggest a parser failure might be the cause
+        keywords = ["编号", "缺少", "丢失", "不连续", "页码", "不一致", "章节"]
 
-    def _extract_context_around_image(self, page_num: int, section_info: Dict) -> tuple:
-        """
-        【已移出】此方法已移至VisionAgent中
-        """
-        raise NotImplementedError("此方法已移至VisionAgent，请通过VisionAgent调用")
+        # 兼容中英文 issue_type
+        if issue_type in ["Format", "规范性"] and any(
+            k in suggestion for k in keywords
+        ):
+            return True
+        return False
 
-    def _extract_text_claims(self, figure_unit: Dict) -> List[Dict]:
+    def verify_with_vision(self, issue):
         """
-        【已移出】此方法已移至VisionAgent中
+        Verify a normative issue using Vision Model.
+        Returns (is_real, reason_str). is_real=None means unverifiable.
         """
-        raise NotImplementedError("此方法已移至VisionAgent，请通过VisionAgent调用")
+        page = issue.get("page")
+        if not page or not str(page).isdigit():
+            return None, "无法验证：缺少有效页码"
 
-    def _analyze_image_evidence(self, client, vision_model_id: str, figure_unit: Dict) -> Optional[Dict]:
-        """
-        【已移出】此方法已移至VisionAgent中
-        """
-        raise NotImplementedError("此方法已移至VisionAgent，请通过VisionAgent调用")
+        page_num = int(float(page))
+        suggestion = issue.get("suggestion", "")
 
-    def _analyze_context_fitness(self, figure_unit: Dict, image_evidence: Dict) -> Dict:
-        """
-        【已移出】此方法已移至VisionAgent中
-        """
-        raise NotImplementedError("此方法已移至VisionAgent，请通过VisionAgent调用")
+        # DEBUG: Check calculated path
+        index_string = "%04d" % (int(page_num) - 1)
+        expected_path = (
+            self.doc_reader.data_path + "/page_images/page_" + index_string + ".png"
+        )
+        print(f"[Verification] Debug: Issue Page={page} -> Path={expected_path}")
 
-    def _judge_consistency(
-        self,
-        text_claims: List[Dict],
-        image_evidence: Dict,
-        context_fitness: Dict,
-        figure_unit: Dict
-    ) -> Dict:
-        """
-        【已移出】此方法已移至VisionAgent中
-        """
-        raise NotImplementedError("此方法已移至VisionAgent，请通过VisionAgent调用")
-
-    def _analyze_image_text_consistency_structured(
-        self, figure_unit: Dict, client, vision_model_id: str
-    ) -> Dict:
-        """
-        【已移出】此方法已移至VisionAgent中
-        """
-        raise NotImplementedError("此方法已移至VisionAgent，请通过VisionAgent调用")
-
-    def run_vision_review(
-        self,
-        vision_model_id="qwen3-vl-flash",
-        max_images=50,
-        vision_api_key=None,
-        vision_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        parallel=None,
-        max_workers=None,
-    ):
-        """
-        【已移出】此方法已移至VisionAgent中
-        """
-        raise NotImplementedError("此方法已移至VisionAgent，请通过VisionAgent调用")
-
-    def run_vision_review_parallel(
-        self,
-        vision_model_id="qwen3-vl-flash",
-        max_images=50,
-        vision_api_key=None,
-        vision_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        max_workers=3,
-    ):
-        """
-        【已废弃】并行版本已移除，请使用串行版本 run_vision_review()
-        
-        此方法保留仅为向后兼容，实际会抛出异常提示使用串行版本。
-        """
-        raise NotImplementedError(
-            "并行模式已废弃。请使用串行模式 run_vision_review()，"
-            "它使用6步结构化流程：Figure Unit构建 → Text Claims抽取 → "
-            "Image Evidence分析 → Context Fitness分析 → Judge裁决 → 格式化输出"
+        print(
+            f"[Verification] Checking page {page_num} for issue: {suggestion[:30]}..."
         )
 
-    def get_outline(self):
+        try:
+            media_type, base64_img, error = self.doc_reader.get_page_image(page_num)
+            if error:
+                return None, f"无法加载图片: {error}"
+
+            prompt = vision_verify_prompt.format(issue_description=suggestion)
+
+            # Determine client (reuse logic from run_vision_review or simplify)
+            # Assuming Qwen/Dashscope for vision
+            client = self.client
+            model_id = "qwen3-vl-flash"  # Default for verification
+
+            # Construct message
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{base64_img}"
+                            },
+                        },
+                    ],
+                }
+            ]
+
+            import os
+
+            vision_api_key = os.getenv("DASHSCOPE_API_KEY")
+            if not vision_api_key:
+                print("[Verification] Skipped: DASHSCOPE_API_KEY not found.")
+                return None, "缺少 Vision API Key"
+
+            from openai import OpenAI
+
+            vision_client = OpenAI(
+                api_key=vision_api_key,
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            )
+
+            response = vision_client.chat.completions.create(
+                model="qwen3-vl-flash",
+                messages=messages,
+                max_tokens=500,
+                temperature=0.0,  # 降低温度确保视觉验证结果稳定
+            )
+
+            res_json = self._parse_json(response.choices[0].message.content)
+            is_real = res_json.get("is_real")
+            if is_real is None:
+                is_real = not res_json.get("is_false_positive", False)
+            reason = res_json.get("reason", "无理由")
+
+            # 兜底修正：通过 reason 的语义判断真实意图，纠正 JSON 字段可能的错误
+            # 如果 reason 明确表示"问题属实/确实缺失/确实存在问题"，则应该是 True（真实存在）
+            true_issue_markers = [
+                "问题属实",
+                "确实缺失",
+                "确实没有",
+                "确实不存在",
+                "确实错误",
+                "实际缺失",
+                "内容缺失",
+            ]
+            # 如果 reason 明确表示"误报/不成立/解析器遗漏/实际存在"，则应该是 False（误报）
+            false_positive_markers = [
+                "误报",
+                "误判",
+                "不成立",
+                "解析器遗漏",
+                "PDF解析器遗漏",
+                "实际存在",
+                "清晰显示",
+                "完整存在",
+                "格式正确",
+                "编号完整",
+            ]
+
+            # 优先根据语义判断
+            if any(m in reason for m in true_issue_markers):
+                is_real = True  # 问题真实存在
+                print(
+                    f"[Verification] Issue is REAL (corrected by reason): {reason[:60]}..."
+                )
+            elif any(m in reason for m in false_positive_markers):
+                is_real = False  # 问题是误报
+                print(
+                    f"[Verification] False positive detected (corrected by reason): {reason[:60]}..."
+                )
+
+            return is_real, reason
+
+        except Exception as e:
+            print(f"[Verification] Failed: {e}")
+            return None, str(e)
+
+    def run_normative_review(self):
+        """规范性审查，不使用工具，返回包含 raw 和 thinking 的字典。"""
+        print("[Agent] Starting Normative Review...")
+        res = self._run_simple_review(normative_prompt)
+        res["raw_original"] = res.get("raw", "")
+
+        # Debug: 显示原始输出的前500字符
+        print(f"[Debug] Normative raw output preview: {res.get('raw', '')[:500]}...")
+
+        # Parse initial issues
+        data = self._parse_json(res["raw"])
+        initial_issues = data.get("issues", [])
+        verified_issues = []
+
+        print(f"[Agent] Initial Normative Issues: {len(initial_issues)}")
+        if len(initial_issues) == 0:
+            print(f"[Warning] 规范性审查未发现任何问题，这可能不正常。请检查模型输出。")
+
+        verification_log = "\n\n### 👁️ 视觉验证环节 (Visual Verification)\n"
+        verification_log += "针对潜在的 PDF 解析误差（如章节丢失、页码错误），Agent 调用了视觉模型对原始页面进行了二次核查：\n\n"
+        has_verification = False
+
+        for issue in initial_issues:
+            if self._needs_vision_verification(issue):
+                has_verification = True
+                print(
+                    f"[Verification] Checking issue: {issue.get('suggestion', '')[:60]}..."
+                )
+                is_real, reason = self.verify_with_vision(issue)
+                if is_real is None:
+                    verified_issues.append(issue)
+                    verification_log += f"- ❌ **保留 Issue**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 无法验证，默认保留。({reason})\n"
+                    print(
+                        f"[Verification] ⚠️ Issue kept (unverifiable): {issue.get('suggestion', '')[:40]}..."
+                    )
+                elif is_real:
+                    verified_issues.append(issue)
+                    verification_log += f"- ❌ **保留 Issue**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 问题属实或无法排除。({reason})\n"
+                    print(
+                        f"[Verification] ❌ Issue kept: {issue.get('suggestion', '')[:40]}..."
+                    )
+                else:
+                    verification_log += f"- ✅ **移除误报 (False Positive)**: `{issue.get('suggestion', '')[:40]}...`\n  - *视觉核查结果*: 页面截图显示该内容实际存在，系解析器遗漏。({reason})\n"
+                    print(f"[Verification] ✅ Issue removed as false positive")
+            else:
+                verified_issues.append(issue)
+                print(
+                    f"[Verification] Issue skipped (no verification needed): {issue.get('suggestion', '')[:60]}..."
+                )
+
+        if has_verification:
+            # Append log to thinking
+            current_thinking = res.get("thinking", "")
+            if not current_thinking:
+                current_thinking = "（无初始思考过程）"
+            res["thinking"] = current_thinking + verification_log
+
+        # Update JSON in raw response (hacky but keeps compatibility)
+        data["issues"] = verified_issues
+        res["raw"] = json.dumps(data, ensure_ascii=False, indent=2)  # Update raw json
+
+        print(f"[Agent] Verified Normative Issues: {len(verified_issues)}")
+        if verified_issues:
+            print(
+                f"[Debug] Sample verified issue: {verified_issues[0].get('suggestion', '')[:60]}..."
+            )
+        else:
+            print(f"[Warning] No verified issues remaining after vision verification!")
+        return res
+
+    def _extract_chapter_facts(self, chapter_content, chapter_info):
+        """
+        从章节内容中提取细粒度事实（用于跨章节冲突检测）
+
+        Args:
+            chapter_content: 章节内容（XML字符串）
+            chapter_info: 章节信息字典（包含title, section_id, page等）
+
+        Returns:
+            dict: {"entities": [...], "numbers": [...], "dates": [...], "claims": [...]}
+        """
+        print(
+            f"[Fact Extraction] Extracting facts from: {chapter_info.get('title', 'Unknown')}"
+        )
+
+        fact_extraction_prompt = """
+你是一个精确的事实提取专家。请从以下章节内容中提取关键事实，用于后续的跨章节一致性验证。
+
+请提取以下类型的事实：
+
+1. **实体（Entities）**：人名、角色、机构、公司等
+   - 示例：{"type": "人物角色", "key": "甲方", "value": "张三"}
    - 示例：{"type": "机构", "key": "项目单位", "value": "XX科技有限公司"}
 
 2. **数值（Numbers）**：性能指标、实验数据、统计数字等
@@ -763,7 +1004,331 @@ class DocAgent:
         print("[Agent] Starting Logic Review...")
         return self._run_simple_review(logic_prompt)
 
-    def run_normative_logic_review(self):
+    def run_hierarchical_logic_review(self):
+        """
+        层次化逻辑审查 (Map-Reduce)。
+        1. 将文档分割为章节。
+        2. Map: 审查每个章节（局部逻辑 + 摘要）。
+        3. Reduce: 基于摘要进行全局一致性审查。
+        """
+        print("[Agent] Starting Hierarchical Logic Review...")
+        # 重置逻辑内存
+        self.logic_memory = []
+
+        # ✅ 重置事实存储（用于细粒度冲突检测）
+        self.fact_store = {"entities": {}, "numbers": {}, "dates": {}, "claims": []}
+        print("[Fact Store] Initialized for cross-chapter conflict detection")
+
+        # Step 0: Let LLM select top/important sections (skip front matter)
+        top_sections = self.select_top_sections(max_sections=8, skip_front_matter=True)
+        print(f"[Logic] Selected sections (skipping front matter): {top_sections}")
+
+        # Build chapters list from selected section_ids (fallback to top-level if empty)
+        chapters = []
+        use_ids = top_sections if top_sections else []
+        if not use_ids:  # fallback to top-level children
+            for child in self.doc_reader.root:
+                if child.tag == "Section" and child.get("section_id"):
+                    use_ids.append(child.get("section_id"))
+                    if len(use_ids) >= 8:
+                        break
+
+        for sid in use_ids:
+            try:
+                sec_root = self.doc_reader.get_section_content(sid)
+            except Exception:
+                continue
+            # Extract title from Heading or Title
+            title_text = f"Section {sid}"
+            for node in sec_root:
+                if node.tag in ["Heading", "Title"] and node.text:
+                    title_text = node.text
+                    break
+            # Serialize subtree to text (XML string) after filtering header/footer noise
+            filtered_root = self._filter_header_footer_from_section(sec_root)
+            content_xml = ET.tostring(filtered_root, encoding="unicode", method="xml")
+            chapters.append(
+                {
+                    "section_id": sid,
+                    "title": title_text,
+                    "content_xml": content_xml,
+                    "start_page_num": sec_root.get("start_page_num"),
+                }
+            )
+
+        if not chapters:
+            print("[Logic] No chapters found, aborting logic review.")
+            return {
+                "raw": json.dumps({"issues": []}),
+                "thinking": "[Error] No chapters to review",
+            }
+
+        print(f"[Logic] Will review {len(chapters)} selected chapters.")
+
+        map_results = []
+        full_thinking_log = "=== 分章节审查 (Local Review) ===\n"
+
+        # Step 2: Map
+        for i, chap in enumerate(chapters):
+            print(f"[Logic] Reviewing Chapter {i+1}: {chap['title']}")
+
+            # Use XML content directly; limit length if huge
+            content_snippet = chap["content_xml"][:12000]
+
+            messages = [
+                {"role": "system", "content": local_chapter_review_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"章节标题：{chap['title']}\n"
+                        f"章节XML内容：\n{content_snippet}\n\n"
+                        "请按约定输出 JSON，必须包含 chapter_summary。"
+                        "注意直接使用 XML 节点中的 page_num，如果节点没有 page_num 再用章节 start_page_num 兜底，不要猜测页码。"
+                    ),
+                },
+            ]
+
+            try:
+                response = self._call_llm(messages, max_tokens=8192, temperature=0.0)
+                raw_res = response.choices[0].message.content
+
+                # 【日志1】打印原始响应（前500字符）
+                print(f"[Logic Debug] Chapter {i+1} Raw Response (first 500 chars):")
+                print(raw_res[:500])
+                print("---")
+
+                data = self._parse_json(raw_res)
+
+                # Collect thinking
+                thinking_match = re.search(
+                    r"<thinking>(.*?)</thinking>", raw_res, re.DOTALL
+                )
+                thinking = thinking_match.group(1).strip() if thinking_match else ""
+
+                full_thinking_log += (
+                    f"\n#### Chapter {i+1}: {chap['title']}\n{thinking}\n"
+                )
+
+                # 提取章节摘要
+                chapter_summary = (
+                    data.get("chapter_summary") if isinstance(data, dict) else ""
+                )
+
+                # 【兜底】如果摘要为None或空，使用兜底文本
+                if not chapter_summary or chapter_summary == "None":
+                    chapter_summary = f"[摘要解析失败] 第{i+1}章《{chap['title']}》的摘要未能正确生成，可能因为模型输出不完整或JSON格式错误。"
+                    print(
+                        f"[Logic WARNING] Chapter {i+1} 摘要为空或None，已使用兜底文本"
+                    )
+
+                # 【日志2】打印解析出的摘要
+                print(
+                    f"[Logic Debug] Chapter {i+1} Parsed Summary: '{chapter_summary}'"
+                )
+                print(f"[Logic Debug] Summary Length: {len(chapter_summary)}")
+
+                # 写入逻辑内存
+                memory_entry = {
+                    "section_id": chap.get("section_id"),
+                    "title": chap["title"],
+                    "summary": chapter_summary,
+                }
+                self.logic_memory.append(memory_entry)
+
+                # 【日志3】验证写入逻辑内存后的内容
+                print(
+                    f"[Logic Debug] Stored in logic_memory: section_id={memory_entry['section_id']}, title={memory_entry['title']}, summary_len={len(memory_entry['summary'])}"
+                )
+
+                # ✅ 新增：提取并存储细粒度事实（用于跨章节冲突检测）
+                try:
+                    chapter_facts = self._extract_chapter_facts(
+                        chapter_content=chap["content_xml"],
+                        chapter_info={
+                            "title": chap["title"],
+                            "section_id": chap.get("section_id"),
+                            "start_page_num": chap.get("start_page_num"),
+                        },
+                    )
+                    self._store_facts(
+                        chapter_facts,
+                        chapter_info={
+                            "title": chap["title"],
+                            "start_page_num": chap.get("start_page_num"),
+                        },
+                    )
+                except Exception as fact_error:
+                    print(f"[Fact Extraction] Failed for chapter {i+1}: {fact_error}")
+                    # 事实提取失败不影响主流程
+
+                map_results.append(
+                    {
+                        "title": chap["title"],
+                        "summary": chapter_summary,
+                        "issues": data.get("issues", []),
+                        "start_page_num": chap.get("start_page_num"),
+                        "section_id": chap.get("section_id"),
+                    }
+                )
+
+            except Exception as e:
+                print(f"[Logic] Failed to review chapter {i+1}: {e}")
+                # 【兜底】即使失败也要加入logic_memory，避免全局阶段缺失章节
+                fallback_summary = f"[审查失败] 第{i+1}章《{chap['title']}》审查过程中出现异常：{str(e)}"
+
+                self.logic_memory.append(
+                    {
+                        "section_id": chap.get("section_id"),
+                        "title": chap["title"],
+                        "summary": fallback_summary,
+                    }
+                )
+                print(
+                    f"[Logic Debug] Exception fallback: Added to logic_memory with error summary"
+                )
+
+                map_results.append(
+                    {
+                        "title": chap["title"],
+                        "summary": fallback_summary,
+                        "issues": [],
+                        "start_page_num": chap.get("start_page_num"),
+                        "section_id": chap.get("section_id"),
+                    }
+                )
+
+        # 为缺失页码的章节级 issue 填充章节起始页
+        for res in map_results:
+            start_page = res.get("start_page_num")
+            if start_page:
+                for issue in res["issues"]:
+                    if not issue.get("page"):
+                        issue["page"] = start_page
+
+        # Step 3: Reduce
+        print("[Logic] Starting Global Reduction...")
+
+        # 【日志4】在全局阶段开始前，打印逻辑内存的完整内容
+        print("\n[Logic Debug] === Logic Memory Content ===")
+        print(f"[Logic Debug] Total entries in logic_memory: {len(self.logic_memory)}")
+        for idx, mem_entry in enumerate(self.logic_memory):
+            print(f"[Logic Debug] Entry {idx+1}:")
+            print(f"  - section_id: {mem_entry.get('section_id')}")
+            print(f"  - title: {mem_entry.get('title')}")
+            print(
+                f"  - summary: {mem_entry.get('summary')[:100]}..."
+                if len(mem_entry.get("summary", "")) > 100
+                else f"  - summary: {mem_entry.get('summary')}"
+            )
+        print("[Logic Debug] =============================\n")
+
+        # Construct global context from summaries（优先使用逻辑内存中的摘要）
+        global_context = ""
+        title_page_map = {}
+        section_page_map = {}
+        mem_list = self.logic_memory if self.logic_memory else map_results
+        for i, res in enumerate(mem_list):
+            global_context += f"【章节 {i+1}】{res.get('title','未知章节')}\n摘要：{res.get('summary','无摘要')}\n\n"
+        # 依然从 map_results 构建页码索引
+        for res in map_results:
+            if res.get("start_page_num"):
+                title_page_map[res["title"]] = res["start_page_num"]
+            if res.get("section_id") and res.get("start_page_num"):
+                section_page_map[res["section_id"]] = res["start_page_num"]
+        fallback_page = list(title_page_map.values())[0] if title_page_map else None
+
+        # 【日志5】打印将要传递给全局LLM的global_context
+        print("\n[Logic Debug] === Global Context (sent to LLM) ===")
+        print(global_context)
+        print("[Logic Debug] =====================================\n")
+
+        messages = [
+            {
+                "role": "system",
+                "content": global_logic_review_prompt.format(
+                    global_context=global_context
+                ),
+            },
+            {"role": "user", "content": "请基于以上各章摘要进行全局逻辑一致性检查。"},
+        ]
+
+        try:
+            response = self._call_llm(messages, max_tokens=8192, temperature=0.0)
+            raw_res = response.choices[0].message.content
+
+            # 【日志6】打印全局LLM原始响应（前1000字符）
+            print(f"[Logic Debug] Global LLM Raw Response (first 1000 chars):")
+            print(raw_res[:1000])
+            print("---")
+
+            global_data = self._parse_json(raw_res)
+
+            # Collect global thinking
+            thinking_match = re.search(
+                r"<thinking>(.*?)</thinking>", raw_res, re.DOTALL
+            )
+            global_thinking = thinking_match.group(1).strip() if thinking_match else ""
+
+            full_thinking_log += (
+                f"\n=== 全局一致性审查 (Global Review) ===\n{global_thinking}\n"
+            )
+
+            # Merge issues
+            all_issues = []
+            # Local issues
+            for res in map_results:
+                all_issues.extend(res["issues"])
+            # Global issues
+            all_issues.extend(global_data.get("issues", []))
+
+            # ✅ 新增：细粒度事实冲突检测
+            print(
+                "\n[Fact Conflict Detection] Starting cross-chapter fact verification..."
+            )
+            fact_conflicts = self._detect_fact_conflicts()
+            all_issues.extend(fact_conflicts)
+            print(
+                f"[Fact Conflict Detection] Added {len(fact_conflicts)} conflict issues\n"
+            )
+
+            # 为无页码的 issue 做兜底填充（优先按章节标题/section_id匹配其起始页，再尝试quote匹配，否则用首章节页码）
+            for issue in all_issues:
+                if not issue.get("page"):
+                    sec_title = issue.get("section")
+                    sec_id = issue.get("section_id") or issue.get("section")
+                    if sec_title and sec_title in title_page_map:
+                        issue["page"] = title_page_map[sec_title]
+                    elif sec_id and sec_id in section_page_map:
+                        issue["page"] = section_page_map[sec_id]
+                    else:
+                        # 试图通过 quote 在 XML 中查找所在页
+                        quote_page = self._find_page_by_quote(issue.get("quote"))
+                        if not quote_page:
+                            quote_page = self._find_page_by_fuzzy_quote(
+                                issue.get("quote"), threshold=0.6
+                            )
+                        if quote_page:
+                            issue["page"] = quote_page
+                        elif fallback_page:
+                            issue["page"] = fallback_page
+
+            return {
+                "raw": json.dumps({"issues": all_issues}, ensure_ascii=False, indent=2),
+                "thinking": full_thinking_log,
+            }
+
+        except Exception as e:
+            print(f"[Logic] Global reduction failed: {e}")
+            return {
+                "raw": json.dumps({"issues": []}),
+                "thinking": full_thinking_log
+                + "\n=== 全局一致性审查 (Global Review) ===\n"
+                + f"[Error] 全局分析失败：{e}",
+            }
+
+    # ==================== 结构化图文一致性审查方法 ====================
+    
+    def _build_figure_unit(self, img_id: str, image_info: Dict, base64_img: str, media_type: str) -> Optional[Dict]:
         """
         Step 1: 构建Figure Unit（核心数据结构）
         
