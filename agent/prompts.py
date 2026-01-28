@@ -36,6 +36,7 @@ normative_prompt = """
 2. **页码偏差**：大纲中的页码是物理页序（从第1张纸开始算），而目录中的页码是逻辑页序（可能跳过封面）。请忽略 10 页以内的页码误差。
 3. **嵌套错误**：部分子章节可能被错误地挂载到了上一级章节。
 4. **标题断行允许**：论文题目或章节标题可以出现在多行（合理断行），这不是格式错误，除非出现明显断裂导致含义不完整。
+5. **忽略题目审查**：不要对论文题目/标题内容本身提出任何规范性问题（包括题目是否准确、措辞是否规范、是否完整等），也不要输出与“题目/标题内容质量”相关的建议。
 
 步骤：
 1. 在 <thinking> 标签内简要说明你的检查思路（聚焦格式）。
@@ -128,7 +129,7 @@ vision_verify_prompt = """
 """
 
 local_chapter_review_prompt = """
-你是一名学术论文分章节审查员。你的任务是对给定的【单章内容】进行微观逻辑审查和摘要提取。
+你是一名学术论文分章节审查员。你的任务是对给定的【单章内容】进行微观逻辑审查，并输出“可供系统使用的逻辑骨架摘要”。
 
 请执行以下任务：
 1. **微观逻辑纠错 (Local Logic Review)**：
@@ -136,9 +137,17 @@ local_chapter_review_prompt = """
    - 检查语言是否学术化，是否存在口语表达。
    - 检查段落衔接是否自然。
 
-2. **内容摘要提取 (Summarization)**：
-   - 用精炼的语言概括本章的核心论点、关键数据和结论（用于后续全局比对）。
+2. **双层摘要输出**：
+   - **local_summary**：给人读的自然语言总结（简洁但具体）。
+   - **logic_skeleton**：给系统用的“逻辑骨架”，必须结构化、可对齐、可比对。
+     - chapter_role 只能从：METHOD | RESULT | DESIGN | BACKGROUND | CONCLUSION 中选择。
+     - core_claims 至少 1 条，必须是明确论断，避免空泛表述（如“介绍了”“分析了”）。
+     - dependencies/outputs 可为空数组，但尽量提供明确依赖与产出。
    - **重点**：如果这是“引言/摘要”章，请提取作者承诺要解决的问题；如果这是“结论”章，请提取作者声称已解决的问题。
+
+3. **稳定性自检**：
+   - 检查 chapter_role 是否明确、core_claims 是否至少 1 条、是否存在空泛表述。
+   - 输出 stability_check：{ "is_stable": true/false, "reason": "..." }
 
 请在 <thinking> 标签内进行分析。
 然后仅输出 <json> 块（issue_type 必须从以下类型中选择：逻辑性、语言、连贯性）。
@@ -150,7 +159,17 @@ local_chapter_review_prompt = """
 
 <json> 中的 JSON 格式如下：
 {
-  "chapter_summary": "本章主要介绍了...核心论点是...数据表明...",
+  "local_summary": "本章主要介绍了...核心论点是...数据表明...",
+  "logic_skeleton": {
+    "chapter_role": "METHOD|RESULT|DESIGN|BACKGROUND|CONCLUSION",
+    "core_claims": ["明确论断1", "明确论断2"],
+    "dependencies": ["依赖1", "依赖2"],
+    "outputs": ["产出1"]
+  },
+  "stability_check": {
+    "is_stable": true,
+    "reason": "核心论断明确，章节角色清晰"
+  },
   "issues": [
     {
       "issue_type": "逻辑性|语言|连贯性",
@@ -169,8 +188,22 @@ local_chapter_review_prompt = """
 - "连贯性"：段落衔接不自然、章节过渡生硬等连贯性问题
 """
 
+local_chapter_review_retry_prompt = """
+你是学术论文分章节审查员。上一轮输出不稳定，请严格按要求重做：
+1) 必须输出 logic_skeleton，chapter_role 只能从 METHOD|RESULT|DESIGN|BACKGROUND|CONCLUSION 中选择。
+2) core_claims 必须至少 1 条，且必须是明确论断，不得出现“介绍了/分析了/讨论了/阐述了”等空泛表述。
+3) 必须输出 stability_check，若仍不满足规则，请将 is_stable 设为 false 并说明原因。
+4) 仍需输出 issues（可为空数组）。
+
+只输出 <thinking> 与 <json> 两个块，不要输出任何额外文本或 Markdown。
+"""
+
 global_logic_review_prompt = """
 你是一名本科生毕业论文总审查员。按照本科生毕业论文质量标准，基于各章节的【高密度逻辑骨架】进行全局一致性检查。
+
+【重要说明】
+- 以下内容是“章节逻辑骨架”，不是原文文本。
+- 逻辑骨架已经经过降噪与加权，请不要将其当作完整段落进行复述。
 
 【输入素材】
 {global_context}
@@ -828,4 +861,64 @@ judge_prompt = """
 - 必须基于结构化信息做判断，不是"感觉"
 - 必须输出JSON格式，不要包含thinking或其他文本
 - 如果所有主张都被支持且位置合理，issues应为空数组
+"""
+
+argument_role_prompt = """
+你是一个论证角色识别器。你的任务是仅基于“明确引用图片的句子”判断图片在论证中的角色。
+
+【输入】
+- 图片引用句子列表（只包含明确提到图号/figure的句子）
+
+【约束】
+- 只能依据这些句子，不能推断或补充新的主张
+- 不得使用章节全文或其他上下文
+
+【输出格式】
+只输出JSON，不要包含其他任何文本：
+{
+  "role": "PROBLEM|METHOD_REFERENCE|RESULT_CLAIM|INTERPRETATION|BACKGROUND|OTHER|UNKNOWN",
+  "confidence": 0.0-1.0,
+  "evidence_sentence": "用于判定的原句"
+}
+"""
+
+local_stage_alignment_prompt = """
+你是一个论证阶段分类器。你的任务是基于“引用句子”及其“局部上下文段落”，判断该图引用所在的论证阶段。
+
+【输入】
+- 引用句子
+- 1-3 段局部上下文
+
+【约束】
+- 只能输出以下阶段之一：METHOD / EVIDENCE / INTERPRETATION
+- 必须输出JSON，不要包含任何其他文本
+
+【输出格式】
+{
+  "stage": "METHOD|EVIDENCE|INTERPRETATION",
+  "confidence": 0.0-1.0
+}
+"""
+
+image_capacity_prompt = """
+你是一个图像信息容量评估器。你的任务是判断图片是否具备完成其“论证角色”所需的信息容量。
+
+【输入】
+- 图片
+- 图片标题（Caption）
+- 论证角色（role）
+
+【约束】
+- 只判断“是否有足够信息容量”
+- 不判断正确性，不推断作者意图
+- 不读取章节内容
+
+【输出格式】
+只输出JSON，不要包含其他任何文本：
+{
+  "role": "PROBLEM|METHOD_REFERENCE|RESULT_CLAIM|INTERPRETATION|BACKGROUND|OTHER|UNKNOWN",
+  "sufficient": true/false,
+  "reason": "简要原因（1-2句话）",
+  "image_type": "metric_curve|quantitative_plot|evaluation_chart|bar_chart|table|method_diagram|architecture_diagram|flowchart|framework_diagram|other"
+}
 """

@@ -164,7 +164,7 @@ def main():
         "doc_id": doc_id,
         "normative_thinking": norm_res.get("thinking", ""),
         "logic_thinking": logic_res.get("thinking", ""),
-        "vision_thinking": "\n".join([v.get("thinking", "") for v in vision_res]),
+        "vision_thinking": "",
         "issues": []
     }
 
@@ -172,21 +172,15 @@ def main():
     final_result["issues"].extend(norm_data.get("issues", []))
     final_result["issues"].extend(logic_data.get("issues", []))
 
-    # 添加视觉问题 - 使用改进的解析方法
+    # 添加视觉问题（ARG流程直接返回结构化 issues）
     for v in vision_res:
-        raw = v.get("raw", "")
-        if raw:
-            data = _parse_json_response(raw)
-            issues = data.get("issues", [])
-
-            # 为每个视觉问题补充 image_id 和 page 信息
-            for issue in issues:
-                if not issue.get("image_id"):
-                    issue["image_id"] = v.get("image_id", "")
-                if not issue.get("page"):
-                    issue["page"] = v.get("page", None)
-
-            final_result["issues"].extend(issues)
+        issues = v.get("issues", [])
+        for issue in issues:
+            if not issue.get("image_id"):
+                issue["image_id"] = v.get("figure_id", "")
+            if not issue.get("page"):
+                issue["page"] = v.get("page", None)
+        final_result["issues"].extend(issues)
 
     # 保存结果
     import json

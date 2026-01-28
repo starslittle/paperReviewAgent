@@ -124,33 +124,33 @@ class DocIRBuilder:
             page_bbox_max[page_idx] = (max(max_x, x2), max(max_y, y2))
         return page_bbox_max
 
-    def _get_heading_level(self, text: str) -> int:
+    def _get_heading_level(self, text: str, has_triple_numbering: bool) -> int:
         """根据标题文本识别层级"""
         text = text.strip()
 
-        # 主章节: "1. 绪论", "2. 相关技术介绍"
-        if re.match(r"^\d+\.\s+[\u4e00-\u9fff\w]+", text):
+        # 主章节: "1. 绪论", "1 绪论", "2 相关技术介绍"
+        if re.match(r"^\d+(\.)?\s+[\u4e00-\u9fff\w]+", text):
             return 1
 
-        # 子章节: "1.1 研究背景和意义", "2.1 目标检测"
-        if re.match(r"^\d+\.\d+\.\s+[\u4e00-\u9fff\w]+", text):
+        # 子章节: "1.1 研究背景和意义", "1.1. 研究背景和意义", "2.1 目标检测"
+        if re.match(r"^\d+\.\d+(\.)?\s+[\u4e00-\u9fff\w]+", text):
             return 2
 
         # 三级: "1.1.1 XXX", "3.2.1 XXX"
-        if re.match(r"^\d+\.\d+\.\d+\.\s+", text):
+        if re.match(r"^\d+\.\d+\.\d+(\.)?\s+", text):
             return 3
 
         # 三级: 列表项 "（1）精确率" 或 "(1) 精确率"
         if re.match(r"^[（(]\d+[)）]", text):
-            return 3
+            return 4 if has_triple_numbering else 3
 
         # 四级: "1) 召回率" (只有右括号)
         if re.match(r"^\d+\)\s", text):
-            return 4
+            return 5 if has_triple_numbering else 4
 
         return 1  # 默认一级
 
-    def _infer_heading_level_from_text(self, text: str):
+    def _infer_heading_level_from_text(self, text: str, has_triple_numbering: bool):
         """在未标注 Heading 时，根据文本模式推断标题层级"""
         if not text:
             return None
@@ -158,27 +158,40 @@ class DocIRBuilder:
         if not cleaned:
             return None
         # 避免误判超长正文
-        if len(cleaned) > 80:
+        if len(cleaned) > 40:
             return None
 
-        if re.match(r"^第[一二三四五六七八九十百]+章", cleaned):
+        if re.match(r"^第\s*[一二三四五六七八九十百0-9]+\s*章", cleaned):
             return 1
-        if re.match(r"^\d+\.\s+\S", cleaned):
+        if re.match(r"^\d+(\.)?\s+\S", cleaned):
             return 1
-        if re.match(r"^\d+\.\d+\.\s+\S", cleaned):
+        if re.match(r"^\d+\.\d+(\.)?\s+\S", cleaned):
             return 2
-        if re.match(r"^\d+\.\d+\.\d+\.\s+\S", cleaned):
+        if re.match(r"^\d+\.\d+\.\d+(\.)?\s+\S", cleaned):
             return 3
         if re.match(r"^[（(]\d+[)）]\s*\S", cleaned):
-            return 3
+            return 4 if has_triple_numbering else 3
         if re.match(r"^\d+\)\s+\S", cleaned):
-            return 4
+            return 5 if has_triple_numbering else 4
 
         return None
+
+    def _has_triple_numbering(self, data: pd.DataFrame) -> bool:
+        for _, row in data.iterrows():
+            para = row.get("para_text", "")
+            if not isinstance(para, str):
+                continue
+            cleaned = para.strip()
+            if not cleaned:
+                continue
+            if re.match(r"^\d+\.\d+\.\d+(\.)?\s+\S", cleaned):
+                return True
+        return False
 
     def build_from_pkl(self, data_path: str) -> DocIRBuildResult:
         data_file = os.path.join(data_path, "data.pkl")
         data = pd.read_pickle(data_file)
+        has_triple_numbering = self._has_triple_numbering(data)
 
         image_count, table_count, para_count = 0, 0, 0
         root = ET.Element("Document")
@@ -201,6 +214,7 @@ class DocIRBuilder:
             r"^(第\s*\d+\s*页|\d+\s*页|\d+\s*/\s*\d+|\d+)$",
             re.IGNORECASE,
         )
+        toc_title_tokens = {"目录", "contents", "tableofcontents"}
 
         def _is_table_caption(text: str) -> bool:
             cleaned = re.sub(r"\s+", " ", str(text)).strip()
@@ -318,6 +332,39 @@ class DocIRBuilder:
 
         def _normalize_header_footer_text(text: str) -> str:
             return re.sub(r"\s+", " ", str(text)).strip()
+
+        def _normalize_toc_title(text: str) -> str:
+            return re.sub(r"\s+", "", str(text)).strip().lower()
+
+        def _is_toc_title(text: str) -> bool:
+            normalized = _normalize_toc_title(text)
+            return normalized in toc_title_tokens
+
+        def _is_toc_line(text: str) -> bool:
+            cleaned = re.sub(r"\s+", " ", str(text)).strip()
+            if not cleaned:
+                return False
+            if re.search(r"(\.{2,}|·{2,}|…{2,}|-{2,}|_{2,})", cleaned):
+                return True
+            if re.search(r"[\.·…]\s*\d{1,4}$", cleaned):
+                return True
+            if re.search(r"\s\d{1,4}$", cleaned) and re.match(
+                r"^\d+(\.\d+)*\s+\S", cleaned
+            ):
+                return True
+            return False
+
+        def _should_end_toc(text: str, current_page: int, toc_start_page: int) -> bool:
+            cleaned = re.sub(r"\s+", " ", str(text)).strip()
+            if current_page <= toc_start_page:
+                return False
+            if _is_toc_line(cleaned):
+                return False
+            if re.match(r"^第\s*[一二三四五六七八九十百0-9]+\s*章", cleaned):
+                return True
+            if re.match(r"^\d+(\.)?\s+\S", cleaned):
+                return True
+            return False
 
         def _build_header_footer_index(
             df: pd.DataFrame,
@@ -452,6 +499,11 @@ class DocIRBuilder:
             _build_header_footer_index(data)
         )
 
+        toc_mode = False
+        toc_section_node: Optional[ET.Element] = None
+        toc_section_id: Optional[str] = None
+        toc_start_page = 0
+
         def _append_header_footer(text: str, page_num: int, hf_type: str) -> None:
             target = section_stack[-1][0] if section_stack else root
             tag = "Header" if hf_type == "header" else "Footer"
@@ -472,16 +524,76 @@ class DocIRBuilder:
             # 处理 Heading
             inferred_heading = None
             if not style.startswith("Heading") and isinstance(row["para_text"], str):
-                inferred_heading = self._infer_heading_level_from_text(row["para_text"])
+                inferred_heading = self._infer_heading_level_from_text(
+                    row["para_text"], has_triple_numbering
+                )
                 if inferred_heading is not None:
                     style = f"Heading {inferred_heading}"
 
             if style.startswith("Heading"):
                 heading_text = row["para_text"].strip()
+                if toc_mode and toc_section_node and toc_section_id:
+                    if _should_end_toc(heading_text, current_page, toc_start_page):
+                        toc_mode = False
+                        toc_section_node = None
+                        toc_section_id = None
+                    else:
+                        para = ET.SubElement(
+                            toc_section_node, "Paragraph", page_num=str(current_page)
+                        )
+                        para.text = heading_text
+                        para_count += 1
+                        blocks.append(
+                            TextBlock(
+                                block_id=f"toc_{para_count}",
+                                block_type="Normal",
+                                text=heading_text,
+                                page_num=current_page,
+                                section_id=toc_section_id,
+                            )
+                        )
+                        continue
+
+                if _is_toc_title(heading_text):
+                    while section_stack:
+                        section_stack.pop()
+                    section_counter += 1
+                    current_section_id = str(section_counter)
+                    toc_section_node = ET.SubElement(
+                        root,
+                        "Section",
+                        section_id=current_section_id,
+                        start_page_num=str(current_page),
+                    )
+                    heading = ET.SubElement(toc_section_node, "Heading")
+                    heading.text = heading_text
+                    section_dict[current_section_id] = toc_section_node
+                    section_stack.append((toc_section_node, current_section_id, 1))
+                    sections.append(
+                        SectionNode(
+                            section_id=current_section_id,
+                            title=heading_text,
+                            level=1,
+                            start_page_num=current_page,
+                        )
+                    )
+                    blocks.append(
+                        TextBlock(
+                            block_id=f"heading_{current_section_id}",
+                            block_type=style,
+                            text=heading_text,
+                            page_num=current_page,
+                            section_id=current_section_id,
+                        )
+                    )
+                    toc_mode = True
+                    toc_section_id = current_section_id
+                    toc_start_page = current_page
+                    continue
                 heading_level = (
                     inferred_heading
                     if inferred_heading is not None
-                    else self._get_heading_level(heading_text)
+                    else self._get_heading_level(heading_text, has_triple_numbering)
                 )
                 # 若已识别为标题层级，则不进行页眉/页脚归类
                 if heading_level is None:
@@ -527,7 +639,9 @@ class DocIRBuilder:
                 )
 
                 # 添加 Heading
-                heading = ET.SubElement(current_section_node, "Heading")
+                heading = ET.SubElement(
+                    current_section_node, "Heading", level=str(heading_level)
+                )
                 heading.text = heading_text
 
                 section_dict[current_section_id] = current_section_node
@@ -575,6 +689,23 @@ class DocIRBuilder:
 
             # 处理 Normal - 添加到当前最底层的 Section
             elif style in ["Normal", "Body Text", "List Paragraph", "Footnote"]:
+                if toc_mode and toc_section_node and toc_section_id:
+                    content = row["para_text"]
+                    para = ET.SubElement(
+                        toc_section_node, "Paragraph", page_num=str(current_page)
+                    )
+                    para.text = content
+                    para_count += 1
+                    blocks.append(
+                        TextBlock(
+                            block_id=f"toc_{para_count}",
+                            block_type="Normal",
+                            text=content,
+                            page_num=current_page,
+                            section_id=toc_section_id,
+                        )
+                    )
+                    continue
                 if not section_stack:
                     # 如果栈为空，创建一个默认 Section
                     section_counter += 1
@@ -831,23 +962,6 @@ class DocIRBuilder:
                     )
                 )
                 table_count += 1
-
-        # 为所有 Section 设置结束页码
-        for section_node in root.iter("Section"):
-            if section_node.get("end_page_num") is None:
-                # 查找该 Section 中最后一个元素的页码
-                last_page = "1"
-                for elem in section_node.iter():
-                    if elem.get("page_num"):
-                        last_page = elem.get("page_num", "1")
-                section_node.set("end_page_num", last_page)
-
-        # 更新 sections 的结束页码
-        for section in sections:
-            if section.section_id in section_dict:
-                end_page = section_dict[section.section_id].get("end_page_num")
-                if end_page is not None:
-                    section.end_page_num = int(float(end_page))
 
         # 构建 DocIR
         doc_id = os.path.basename(os.path.abspath(data_path))

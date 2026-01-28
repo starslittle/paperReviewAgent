@@ -238,6 +238,7 @@ def generate_html(json_path, output_path):
         "Coherence": "连贯性",
         "Cohesion": "连贯性",
         "Vision": "图文一致性",
+        "EVIDENCE_GENERALIZATION": "证据外推",
         "Unknown": "未分类",
     }
 
@@ -270,11 +271,36 @@ def generate_html(json_path, output_path):
             caption = issue.get("caption", "")
             image_name = issue.get("image_name", "")
 
+            modification_advice = issue.get("modification_advice", {}) or {}
+            modification_target = modification_advice.get("modification_target", "")
+            modification_reason = modification_advice.get("reason", "")
+            modification_suggestion = modification_advice.get("suggestion", "")
+
+            # 标题描述优先使用 AI 修改建议，保证表述对齐
+            title_suggestion = modification_suggestion or issue.get("suggestion", "")
             suggestion_short = (
-                issue.get("suggestion", "")[:40] + "..."
-                if len(issue.get("suggestion", "")) > 40
-                else issue.get("suggestion", "")
+                title_suggestion[:40] + "..."
+                if len(title_suggestion) > 40
+                else title_suggestion
             )
+
+            modification_target_map = {
+                "MODIFY_FIGURE": "优先改图",
+                "MODIFY_TEXT": "优先改文",
+                "BOTH_LIGHT": "轻微调整（图文均可）",
+            }
+            modification_target_cn = modification_target_map.get(
+                modification_target, modification_target
+            )
+            if isinstance(modification_reason, str) and modification_reason:
+                modification_reason = (
+                    modification_reason.replace("MODIFY_FIGURE", "优先改图")
+                    .replace("MODIFY_TEXT", "优先改文")
+                    .replace("BOTH_LIGHT", "轻微调整")
+                    .replace("EVIDENCE", "证据阶段")
+                    .replace("METHOD", "方法阶段")
+                    .replace("RESULT/COMPARISON", "结果/对比主张")
+                )
 
             # 构建标题：优先显示图片名称，其次显示caption/图表ID
             if img_id:
@@ -328,8 +354,20 @@ def generate_html(json_path, output_path):
                         
                         <div class="suggestion">
                             <strong>🤖 AI 修改建议:</strong><br>
-                            {issue.get('suggestion', '无建议')}
+                            {escape_html(modification_suggestion) or escape_html(issue.get('suggestion', '无建议'))}
                         </div>
+                        {(
+                            f'<div class="suggestion"><strong>🧭 修改方向:</strong><br>'
+                            f'{escape_html(modification_target_cn) or "未给出"}</div>'
+                            if modification_advice
+                            else ""
+                        )}
+                        {(
+                            f'<div class="suggestion"><strong>📌 修改理由:</strong><br>'
+                            f'{escape_html(modification_reason) or "未给出"}</div>'
+                            if modification_advice
+                            else ""
+                        )}
                     </div>
                 </div>
             """

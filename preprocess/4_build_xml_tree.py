@@ -8,7 +8,6 @@
 import argparse
 import os
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
 from doc_ir_builder import DocIRBuilder
 
@@ -132,9 +131,7 @@ def main():
                     docs_to_process.append((doc_id, doc_path))
 
     if not docs_to_process:
-        print(
-            f"[Error] 未找到任何有效的数据。请检查路径或指定 --data-path / --doc-id"
-        )
+        print("[Error] 未找到任何有效的数据。请检查路径或指定 --data-path / --doc-id")
         return
 
     # 处理每个文档
@@ -166,17 +163,17 @@ def main():
             # 保存完整树
             tree = ET.ElementTree(result.root)
             tree.write(xml_output_path, encoding="utf-8", xml_declaration=True)
-            print(f"[✓] 完整 XML 树已保存 -> {xml_output_path}")
+            print(f"[OK] 完整 XML 树已保存 -> {xml_output_path}")
 
             # 保存大纲视图（树状简化版）
             outline_root = _build_outline_from_tree(result.root)
             ET.indent(outline_root, space="  ")
             outline_tree = ET.ElementTree(outline_root)
             outline_tree.write(outline_output_path, encoding="utf-8")
-            print(f"[✓] 大纲视图已保存 -> {outline_output_path}")
+            print(f"[OK] 大纲视图已保存 -> {outline_output_path}")
 
             # 打印统计信息
-            print(f"\n[📊] 统计信息:")
+            print("\n[Stats] 统计信息:")
             print(f"    总页数: {result.num_page}")
             print(f"    图片数: {result.image_count}")
             print(f"    表格数: {result.table_count}")
@@ -190,7 +187,7 @@ def main():
             traceback.print_exc()
             continue
 
-    print(f"\n[✓] 全部处理完成")
+    print("\n[OK] 全部处理完成")
 
 
 if __name__ == "__main__":

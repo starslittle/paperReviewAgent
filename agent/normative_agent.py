@@ -144,6 +144,34 @@ class NormativeAgent:
 
         data = self.doc_agent._parse_json(res["raw"])
         initial_issues = data.get("issues", [])
+        abstract_start_page = None
+        for section in self.doc_agent.doc_reader.root:
+            if section.tag != "Section":
+                continue
+            title_text = ""
+            for node in section:
+                if node.tag in ["Heading", "Title"] and node.text:
+                    title_text = node.text
+                    break
+            if abstract_start_page is None and title_text:
+                if re.search(r"(摘要|abstract|摘\s*要)", title_text, re.IGNORECASE):
+                    abstract_start_page = section.get("start_page_num")
+                    break
+        if abstract_start_page:
+            try:
+                start_page_num = int(float(abstract_start_page))
+            except Exception:
+                start_page_num = None
+            if start_page_num is not None:
+                initial_issues = [
+                    issue
+                    for issue in initial_issues
+                    if not issue.get("page")
+                    or (
+                        str(issue.get("page", "")).isdigit()
+                        and int(float(issue.get("page"))) >= start_page_num
+                    )
+                ]
         verified_issues = []
 
         print(f"[Agent] Initial Normative Issues: {len(initial_issues)}")

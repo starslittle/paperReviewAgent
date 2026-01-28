@@ -8,12 +8,21 @@ from typing import Any, Dict, List
 from .prompts import (
     global_logic_review_prompt,
     local_chapter_review_prompt,
+    local_chapter_review_retry_prompt,
     logic_prompt,
     normative_logic_prompt,
 )
 
 
 class LogicAgent:
+    ROLE_WEIGHTS = {
+        "RESULT": 1.0,
+        "METHOD": 0.9,
+        "DESIGN": 0.8,
+        "BACKGROUND": 0.3,
+        "CONCLUSION": 0.6,
+    }
+
     def __init__(self, doc_agent: Any):
         self.doc_agent = doc_agent
         self.logic_memory: List[Dict[str, Any]] = []
@@ -271,6 +280,98 @@ class LogicAgent:
         print(f"[Fact Conflict Detection] Found {len(conflicts)} conflicts")
         return conflicts
 
+    def _normalize_claim_text(self, text: str) -> str:
+        if not isinstance(text, str):
+            return ""
+        text = text.lower().strip()
+        text = re.sub(r"\s+", "", text)
+        text = re.sub(r"[，。！？；：,.!?;:()（）\"“”‘’'`]", "", text)
+        return text
+
+    def _has_claim_overlap(self, core_claims, fact_claims) -> bool:
+        if not isinstance(core_claims, list) or not isinstance(fact_claims, list):
+            return False
+        normalized_core = [self._normalize_claim_text(c) for c in core_claims if c]
+        normalized_fact = [
+            self._normalize_claim_text(c.get("claim", "")) for c in fact_claims if c
+        ]
+        normalized_core = [c for c in normalized_core if c]
+        normalized_fact = [c for c in normalized_fact if c]
+        if not normalized_core or not normalized_fact:
+            return False
+        for core in normalized_core:
+            for fact in normalized_fact:
+                if core in fact or fact in core:
+                    return True
+        return False
+
+    def _is_logic_skeleton_stable(self, logic_skeleton, stability_check) -> bool:
+        if not isinstance(logic_skeleton, dict):
+            return False
+        chapter_role = logic_skeleton.get("chapter_role")
+        core_claims = logic_skeleton.get("core_claims")
+        if not chapter_role or not isinstance(core_claims, list) or len(core_claims) < 1:
+            return False
+        if isinstance(stability_check, dict):
+            if stability_check.get("is_stable") is False:
+                return False
+        return True
+
+    def _build_global_context(self, mem_list):
+        global_context = ""
+        for i, res in enumerate(mem_list):
+            logic_skeleton = res.get("logic_skeleton") or {}
+            core_claims = logic_skeleton.get("core_claims") or []
+            if not core_claims:
+                continue
+            chapter_role = logic_skeleton.get("chapter_role") or "UNKNOWN"
+            base_weight = self.ROLE_WEIGHTS.get(chapter_role, 0.6)
+            confidence = res.get("confidence", "HIGH")
+            weight = base_weight * (0.5 if confidence == "LOW" else 1.0)
+            global_context += f"【章节 {i+1}】{res.get('title','未知章节')}\n"
+            global_context += f"【章节角色】{chapter_role}\n"
+            global_context += f"【权重】{weight}\n"
+            global_context += "【核心论断】\n"
+            for claim in core_claims:
+                global_context += f"- {claim}\n"
+            dependencies = logic_skeleton.get("dependencies") or []
+            outputs = logic_skeleton.get("outputs") or []
+            if dependencies:
+                global_context += "【依赖】\n"
+                for dep in dependencies:
+                    global_context += f"- {dep}\n"
+            if outputs:
+                global_context += "【产出】\n"
+                for out in outputs:
+                    global_context += f"- {out}\n"
+            global_context += f"【稳定性】{confidence}\n\n"
+        return global_context
+
+    def _get_outermost_section_ids(self) -> List[str]:
+        section_ids = []
+        abstract_start_index = None
+        for idx, child in enumerate(self.doc_agent.doc_reader.root):
+            if child.tag != "Section" or not child.get("section_id"):
+                continue
+            title_text = None
+            for node in child:
+                if node.tag in ["Heading", "Title"] and node.text:
+                    title_text = node.text.strip()
+                    break
+            if title_text:
+                normalized = title_text.lower().replace(" ", "")
+                if any(
+                    key in normalized for key in ["摘要", "abstract", "摘要", "摘 要"]
+                ):
+                    abstract_start_index = idx
+                    break
+        for idx, child in enumerate(self.doc_agent.doc_reader.root):
+            if child.tag == "Section" and child.get("section_id"):
+                if abstract_start_index is not None and idx < abstract_start_index:
+                    continue
+                section_ids.append(child.get("section_id"))
+        return section_ids
+
     def run_hierarchical_logic_review(self) -> Dict[str, Any]:
         """
         层次化逻辑审查 (Map-Reduce)。
@@ -280,19 +381,16 @@ class LogicAgent:
         self.fact_store = {"entities": {}, "numbers": {}, "dates": {}, "claims": []}
         print("[Fact Store] Initialized for cross-chapter conflict detection")
 
-        top_sections = self.doc_agent.select_top_sections(
-            max_sections=8, skip_front_matter=True
-        )
-        print(f"[Logic] Selected sections (skipping front matter): {top_sections}")
+        top_sections = self._get_outermost_section_ids()
+        print(f"[Logic] Selected outermost sections: {top_sections}")
 
         chapters = []
         use_ids = top_sections if top_sections else []
         if not use_ids:
-            for child in self.doc_agent.doc_reader.root:
-                if child.tag == "Section" and child.get("section_id"):
-                    use_ids.append(child.get("section_id"))
-                    if len(use_ids) >= 8:
-                        break
+            print("[Logic] No outermost sections found, fallback to LLM selection.")
+            use_ids = self.doc_agent.select_top_sections(
+                max_sections=8, skip_front_matter=True
+            )
 
         for sid in use_ids:
             try:
@@ -330,65 +428,90 @@ class LogicAgent:
             print(f"[Logic] Reviewing Chapter {i+1}: {chap['title']}")
             content_snippet = chap["content_xml"][:12000]
 
-            messages = [
-                {"role": "system", "content": local_chapter_review_prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        f"章节标题：{chap['title']}\n"
-                        f"章节XML内容：\n{content_snippet}\n\n"
-                        "请按约定输出 JSON，必须包含 chapter_summary。"
-                        "注意直接使用 XML 节点中的 page_num，如果节点没有 page_num 再用章节 start_page_num 兜底，不要猜测页码。"
-                    ),
-                },
-            ]
+            user_content = (
+                f"章节标题：{chap['title']}\n"
+                f"章节XML内容：\n{content_snippet}\n\n"
+                "请按约定输出 JSON，必须包含 local_summary、logic_skeleton、stability_check。"
+                "注意直接使用 XML 节点中的 page_num，如果节点没有 page_num 再用章节 start_page_num 兜底，不要猜测页码。"
+            )
 
             try:
-                response = self.doc_agent._call_llm(
-                    messages, max_tokens=8192, temperature=0.0
+                def _run_local_review(system_prompt):
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ]
+                    response = self.doc_agent._call_llm(
+                        messages, max_tokens=8192, temperature=0.0
+                    )
+                    raw = response.choices[0].message.content
+                    data = self.doc_agent._parse_json(raw)
+                    thinking_match = re.search(
+                        r"<thinking>(.*?)</thinking>", raw, re.DOTALL
+                    )
+                    thinking = (
+                        thinking_match.group(1).strip() if thinking_match else ""
+                    )
+                    return raw, data, thinking
+
+                raw_res, data, thinking = _run_local_review(
+                    local_chapter_review_prompt
                 )
-                raw_res = response.choices[0].message.content
 
                 print(f"[Logic Debug] Chapter {i+1} Raw Response (first 500 chars):")
                 print(raw_res[:500])
                 print("---")
+                if not isinstance(data, dict):
+                    data = {}
 
-                data = self.doc_agent._parse_json(raw_res)
-
-                thinking_match = re.search(
-                    r"<thinking>(.*?)</thinking>", raw_res, re.DOTALL
+                logic_skeleton = data.get("logic_skeleton") or {}
+                stability_check = data.get("stability_check") or {}
+                if not self._is_logic_skeleton_stable(logic_skeleton, stability_check):
+                    print(
+                        f"[Logic WARNING] Chapter {i+1} logic_skeleton unstable, retrying once"
+                    )
+                    raw_res, data, thinking = _run_local_review(
+                        f"{local_chapter_review_prompt}\n\n{local_chapter_review_retry_prompt}"
+                    )
+                    if not isinstance(data, dict):
+                        data = {}
+                    logic_skeleton = data.get("logic_skeleton") or {}
+                    stability_check = data.get("stability_check") or {}
+                low_confidence = not self._is_logic_skeleton_stable(
+                    logic_skeleton, stability_check
                 )
-                thinking = thinking_match.group(1).strip() if thinking_match else ""
+                if low_confidence:
+                    logic_skeleton["confidence"] = "LOW"
 
                 full_thinking_log += (
                     f"\n#### Chapter {i+1}: {chap['title']}\n{thinking}\n"
                 )
 
-                chapter_summary = (
-                    data.get("chapter_summary") if isinstance(data, dict) else ""
-                )
-                if not chapter_summary or chapter_summary == "None":
-                    chapter_summary = (
+                local_summary = data.get("local_summary") if isinstance(data, dict) else ""
+                if not local_summary or local_summary == "None":
+                    local_summary = (
                         f"[摘要解析失败] 第{i+1}章《{chap['title']}》的摘要未能正确生成，可能因为模型输出不完整或JSON格式错误。"
                     )
                     print(
-                        f"[Logic WARNING] Chapter {i+1} 摘要为空或None，已使用兜底文本"
+                        f"[Logic WARNING] Chapter {i+1} local_summary 为空或None，已使用兜底文本"
                     )
 
                 print(
-                    f"[Logic Debug] Chapter {i+1} Parsed Summary: '{chapter_summary}'"
+                    f"[Logic Debug] Chapter {i+1} Parsed Summary: '{local_summary}'"
                 )
-                print(f"[Logic Debug] Summary Length: {len(chapter_summary)}")
+                print(f"[Logic Debug] Summary Length: {len(local_summary)}")
 
                 memory_entry = {
                     "section_id": chap.get("section_id"),
                     "title": chap["title"],
-                    "summary": chapter_summary,
+                    "local_summary": local_summary,
+                    "logic_skeleton": logic_skeleton,
+                    "confidence": "LOW" if low_confidence else "HIGH",
                 }
                 self.logic_memory.append(memory_entry)
 
                 print(
-                    f"[Logic Debug] Stored in logic_memory: section_id={memory_entry['section_id']}, title={memory_entry['title']}, summary_len={len(memory_entry['summary'])}"
+                    f"[Logic Debug] Stored in logic_memory: section_id={memory_entry['section_id']}, title={memory_entry['title']}, confidence={memory_entry['confidence']}"
                 )
 
                 try:
@@ -407,13 +530,21 @@ class LogicAgent:
                             "start_page_num": chap.get("start_page_num"),
                         },
                     )
+                    core_claims = logic_skeleton.get("core_claims") or []
+                    if core_claims and not self._has_claim_overlap(
+                        core_claims, chapter_facts.get("claims", [])
+                    ):
+                        logic_skeleton["confidence"] = "LOW"
+                        low_confidence = True
                 except Exception as fact_error:
                     print(f"[Fact Extraction] Failed for chapter {i+1}: {fact_error}")
 
                 map_results.append(
                     {
                         "title": chap["title"],
-                        "summary": chapter_summary,
+                        "local_summary": local_summary,
+                        "logic_skeleton": logic_skeleton,
+                        "confidence": "LOW" if low_confidence else "HIGH",
                         "issues": data.get("issues", []),
                         "start_page_num": chap.get("start_page_num"),
                         "section_id": chap.get("section_id"),
@@ -430,7 +561,9 @@ class LogicAgent:
                     {
                         "section_id": chap.get("section_id"),
                         "title": chap["title"],
-                        "summary": fallback_summary,
+                        "local_summary": fallback_summary,
+                        "logic_skeleton": {},
+                        "confidence": "LOW",
                     }
                 )
                 print(
@@ -440,7 +573,9 @@ class LogicAgent:
                 map_results.append(
                     {
                         "title": chap["title"],
-                        "summary": fallback_summary,
+                        "local_summary": fallback_summary,
+                        "logic_skeleton": {},
+                        "confidence": "LOW",
                         "issues": [],
                         "start_page_num": chap.get("start_page_num"),
                         "section_id": chap.get("section_id"),
@@ -463,20 +598,17 @@ class LogicAgent:
             print(f"  - section_id: {mem_entry.get('section_id')}")
             print(f"  - title: {mem_entry.get('title')}")
             print(
-                f"  - summary: {mem_entry.get('summary')[:100]}..."
-                if len(mem_entry.get("summary", "")) > 100
-                else f"  - summary: {mem_entry.get('summary')}"
+                f"  - local_summary: {mem_entry.get('local_summary')[:100]}..."
+                if len(mem_entry.get("local_summary", "")) > 100
+                else f"  - local_summary: {mem_entry.get('local_summary')}"
             )
+            print(f"  - confidence: {mem_entry.get('confidence')}")
         print("[Logic Debug] =============================\n")
 
-        global_context = ""
         title_page_map = {}
         section_page_map = {}
         mem_list = self.logic_memory if self.logic_memory else map_results
-        for i, res in enumerate(mem_list):
-            global_context += (
-                f"【章节 {i+1}】{res.get('title','未知章节')}\n摘要：{res.get('summary','无摘要')}\n\n"
-            )
+        global_context = self._build_global_context(mem_list)
         for res in map_results:
             if res.get("start_page_num"):
                 title_page_map[res["title"]] = res["start_page_num"]
@@ -504,7 +636,7 @@ class LogicAgent:
             )
             raw_res = response.choices[0].message.content
 
-            print(f"[Logic Debug] Global LLM Raw Response (first 1000 chars):")
+            print("[Logic Debug] Global LLM Raw Response (first 1000 chars):")
             print(raw_res[:1000])
             print("---")
 

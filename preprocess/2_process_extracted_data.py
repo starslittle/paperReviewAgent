@@ -393,6 +393,28 @@ def main():
             os.path.join(save_path, "data.csv"), index=False, encoding="utf-8-sig"
         )
 
+        # 复制图片到 figures 目录，供后续 DocReader 读取
+        src_images_dir = os.path.join(root_path, "images")
+        dst_figures_dir = os.path.join(save_path, "figures")
+        if os.path.isdir(src_images_dir):
+            os.makedirs(dst_figures_dir, exist_ok=True)
+            copied = 0
+            skipped = 0
+            for filename in os.listdir(src_images_dir):
+                lower = filename.lower()
+                if not lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    continue
+                src_path = os.path.join(src_images_dir, filename)
+                dst_path = os.path.join(dst_figures_dir, filename)
+                if os.path.exists(dst_path):
+                    skipped += 1
+                    continue
+                shutil.copy2(src_path, dst_path)
+                copied += 1
+            print(
+                f"    - figures/ synced from images (copied={copied}, skipped={skipped})"
+            )
+
         print(f"[OK] {sid} processed -> {save_path}/")
         print(f"    - data.pkl (updated with correct headings)")
         print(f"    - data.csv (for debugging)")

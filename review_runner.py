@@ -175,7 +175,16 @@ def main():
             base_url=args.base_url,
         )
 
-        # 仅运行 Vision Agent (其他agent已禁用用于测试)
+        print("[Agent] [Normative] Starting...")
+        normative_out = NormativeAgent(agent).run()
+        normative_data = normative_out.get("parsed", {"issues": []})
+        normative_thinking = normative_out.get("thinking", "")
+
+        print("[Agent] [Logic] Starting...")
+        logic_out = LogicAgent(agent).run()
+        logic_data = logic_out.get("parsed", {"issues": []})
+        logic_thinking = logic_out.get("thinking", "")
+
         if not (reader.image_path_dict or reader.table_image_path_dict):
             vision_data = {"issues": []}
             vision_thinking = ""
@@ -195,13 +204,17 @@ def main():
 
         final_result = {
             "doc_id": doc_id,
-            "normative_thinking": "",
-            "logic_thinking": "",
+            "normative_thinking": normative_thinking,
+            "logic_thinking": logic_thinking,
             "vision_thinking": vision_thinking,
-            "normative_issues": [],
-            "logic_issues": [],
+            "normative_issues": normative_data.get("issues", []),
+            "logic_issues": logic_data.get("issues", []),
             "vision_issues": vision_data.get("issues", []),
-            "issues": vision_data.get("issues", []),
+            "issues": (
+                normative_data.get("issues", [])
+                + logic_data.get("issues", [])
+                + vision_data.get("issues", [])
+            ),
         }
 
         result_file = Path(args.save_dir) / f"review_{doc_id}.json"
@@ -236,7 +249,16 @@ def main():
         except Exception as e:
             print(f"[Warning] Failed to save outline: {e}")
 
-        # 仅运行 Vision Agent (其他agent已禁用用于测试)
+        print("[Agent] [Normative] Starting...")
+        normative_out = NormativeAgent(agent).run()
+        normative_issues = normative_out.get("parsed", {}).get("issues", [])
+        normative_thinking_str = normative_out.get("thinking", "")
+
+        print("[Agent] [Logic] Starting...")
+        logic_out = LogicAgent(agent).run()
+        logic_issues = logic_out.get("parsed", {}).get("issues", [])
+        logic_thinking_str = logic_out.get("thinking", "")
+
         print("[Agent] [Vision] Starting...")
         vision_agent = VisionAgent(agent)
         vision_out = vision_agent.run(
@@ -247,7 +269,7 @@ def main():
             parallel=None,  # 已废弃，不再使用并行模式
             max_workers=None,  # 已废弃，不再使用并行模式
         )
-        
+
         vision_issues = vision_out.get("parsed", {}).get("issues", [])
         vision_thinking_str = vision_out.get("thinking", "")
 
@@ -256,13 +278,13 @@ def main():
 
         merged = {
             "doc_id": doc_id,
-            "normative_thinking": "",
-            "logic_thinking": "",
+            "normative_thinking": normative_thinking_str,
+            "logic_thinking": logic_thinking_str,
             "vision_thinking": vision_thinking_str,
-            "normative_issues": [],
-            "logic_issues": [],
+            "normative_issues": normative_issues,
+            "logic_issues": logic_issues,
             "vision_issues": vision_issues,
-            "issues": vision_issues,
+            "issues": normative_issues + logic_issues + vision_issues,
         }
 
         out_path = Path(args.save_dir) / f"review_{doc_id}.json"
