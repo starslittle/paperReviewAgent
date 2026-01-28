@@ -13,8 +13,16 @@ def generate_html(json_path, output_path):
     doc_id = data.get("doc_id", "Unknown Document")
 
     def escape_html(text):
-        if not text: return ""
-        return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
+        if not text:
+            return ""
+        return (
+            str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&#39;")
+        )
 
     # 预处理思考过程文本，确保不破坏 HTML 结构
     norm_thinking = escape_html(data.get('normative_thinking', '无思考过程'))
@@ -260,6 +268,7 @@ def generate_html(json_path, output_path):
             page = issue.get("page", "N/A")
             img_id = issue.get("image_id", "")
             caption = issue.get("caption", "")
+            image_name = issue.get("image_name", "")
 
             suggestion_short = (
                 issue.get("suggestion", "")[:40] + "..."
@@ -267,14 +276,34 @@ def generate_html(json_path, output_path):
                 else issue.get("suggestion", "")
             )
 
-            # 构建标题：如果有caption，显示caption；否则显示图表ID
+            # 构建标题：优先显示图片名称，其次显示caption/图表ID
             if img_id:
+                image_name_short = (
+                    image_name[:50] + "..." if len(image_name) > 50 else image_name
+                )
                 if caption:
                     # 截断过长的caption（保留前50字符）
                     caption_short = caption[:50] + "..." if len(caption) > 50 else caption
-                    title_text = f"[图表 {img_id}: {caption_short}] [{issue_type}] 第 {page} 页: {suggestion_short}"
+                    if image_name_short:
+                        title_text = (
+                            f"[图表 {img_id} | {image_name_short}: {caption_short}] "
+                            f"[{issue_type}] 第 {page} 页: {suggestion_short}"
+                        )
+                    else:
+                        title_text = (
+                            f"[图表 {img_id}: {caption_short}] "
+                            f"[{issue_type}] 第 {page} 页: {suggestion_short}"
+                        )
                 else:
-                    title_text = f"[图表 {img_id}] [{issue_type}] 第 {page} 页: {suggestion_short}"
+                    if image_name_short:
+                        title_text = (
+                            f"[图表 {img_id} | {image_name_short}] "
+                            f"[{issue_type}] 第 {page} 页: {suggestion_short}"
+                        )
+                    else:
+                        title_text = (
+                            f"[图表 {img_id}] [{issue_type}] 第 {page} 页: {suggestion_short}"
+                        )
             else:
                 title_text = f"[{issue_type}] 第 {page} 页: {suggestion_short}"
 
@@ -289,6 +318,7 @@ def generate_html(json_path, output_path):
                     </div>
                     <div id="issue_{idx}" class="issue-body">
                         <div class="meta">📍 位置: 第 {page} 页 | 章节: {issue.get('section', '未知')}</div>
+                        {f'<div class="meta" style="margin-top: 8px; color: #666;">🖼️ 图片名称: {escape_html(image_name)}</div>' if image_name else ''}
                         {f'<div class="meta" style="margin-top: 8px; color: #666;">📊 图表名称: {escape_html(caption)}</div>' if caption else ''}
                         
                         <div class="quote">

@@ -17,6 +17,9 @@ load_dotenv(override=True, encoding='utf-8')
 sys.path.insert(0, os.getcwd())
 
 from agent import doc_agent
+from agent.logic_agent import LogicAgent
+from agent.normative_agent import NormativeAgent
+from agent.vision_agent import VisionAgent
 from preprocess.doc_reader import DocReader
 import pandas as pd
 
@@ -56,16 +59,16 @@ def main():
     )
 
     print(f"\n[2/5] Running Normative Review...")
-    norm_res = agent.run_normative_review()
+    norm_res = NormativeAgent(agent).run()
     print(f"  - Completed. Issues: {len(norm_res.get('thinking', ''))} chars")
 
     print(f"\n[3/5] Running Hierarchical Logic Review...")
-    logic_res = agent.run_hierarchical_logic_review()
+    logic_res = LogicAgent(agent).run()
     print(f"  - Completed. Thinking: {len(logic_res.get('thinking', ''))} chars")
 
     print(f"\n[4/5] Running Vision Review...")
     print(f"  - This may take several minutes...")
-    vision_res = agent.run_vision_review(
+    vision_res = VisionAgent(agent).run_vision_review(
         vision_model_id="qwen3-vl-flash",
         vision_api_key=vision_api_key,
         vision_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
