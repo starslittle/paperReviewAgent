@@ -42,13 +42,15 @@ class DocAgent:
         # 如果没有提供api_key，使用DASHSCOPE_API_KEY
         if api_key is None:
             import os
+
             api_key = os.getenv("DASHSCOPE_API_KEY")
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.tool_call_wait_time = tool_call_wait_time
         self._header_footer_index = None
         self._header_footer_pages = {}
+        # 页眉页脚特征：含“第X页/页码/学院/…”或排版页码如 “- 28 -”
         self._header_footer_regex = re.compile(
-            r"(第\s*\d+\s*页|页码|学院|专业|指导教师|学校|论文|本科|毕业|\d{4}\s*年)",
+            r"(第\s*\d+\s*页|页码|学院|专业|指导教师|学校|论文|本科|毕业|\d{4}\s*年|^\s*-\s*\d+\s*-\s*$)",
             re.IGNORECASE,
         )
 
@@ -64,7 +66,14 @@ class DocAgent:
 
         per_page_texts = {}
         for elem in self.doc_reader.root.iter():
-            if elem.tag not in ["Paragraph", "Heading", "Title", "Caption", "Header", "Footer"]:
+            if elem.tag not in [
+                "Paragraph",
+                "Heading",
+                "Title",
+                "Caption",
+                "Header",
+                "Footer",
+            ]:
                 continue
             if not elem.text:
                 continue
@@ -145,11 +154,37 @@ class DocAgent:
                     parent.remove(child)
         return filtered
 
+    def _get_abstract_start_section_index(self):
+        """
+        返回第一个标题为「摘要/Abstract」的顶层 Section 的索引（从 0 计）。
+        用于与 LogicAgent、VisionAgent 对齐：三个 Agent 均从「摘要」开始审查。
+        若未找到则返回 None（表示不跳过任何内容）。
+        """
+        for idx, child in enumerate(self.doc_reader.root):
+            if child.tag != "Section":
+                continue
+            title_text = ""
+            for node in child:
+                if node.tag in ["Heading", "Title"] and node.text:
+                    title_text = node.text.strip()
+                    break
+            if title_text and re.search(
+                r"(摘要|abstract|摘\s*要)", title_text, re.IGNORECASE
+            ):
+                return idx
+        return None
+
     def _extract_plain_text(self, char_limit=6000):
         """Extract plain text segments for lightweight review."""
         texts = []
         for elem in self.doc_reader.root.iter():
-            if elem.text and elem.tag in ["Paragraph", "Title", "Caption", "Header", "Footer"]:
+            if elem.text and elem.tag in [
+                "Paragraph",
+                "Title",
+                "Caption",
+                "Header",
+                "Footer",
+            ]:
                 t = elem.text.strip()
                 if t and not self._is_header_footer(t, elem.get("page_num")):
                     texts.append(t)
@@ -158,6 +193,53 @@ class DocAgent:
         combined = "\n".join(texts)
         return combined[:char_limit]
 
+    def _extract_plain_text_from_abstract(self, char_limit=6000, char_offset=0):
+        """
+        仅从「摘要」及之后的章节抽取正文（与 LogicAgent/VisionAgent 起点对齐）。
+
+        Args:
+            char_limit: 窗口大小（字符数）
+            char_offset: 起始偏移量（跳过前 N 个字符）
+
+        Returns:
+            tuple: (text_snippet, actual_start, actual_end, is_end_of_doc)
+                - text_snippet: 抽取的正文片段
+                - actual_start: 实际开始位置（字符数）
+                - actual_end: 实际结束位置（字符数）
+                - is_end_of_doc: 是否已到达文档末尾
+        """
+        abstract_idx = self._get_abstract_start_section_index()
+        all_texts = []  # 先收集全部文本
+
+        for idx, child in enumerate(self.doc_reader.root):
+            if child.tag != "Section":
+                continue
+            if abstract_idx is not None and idx < abstract_idx:
+                continue
+            for elem in child.iter():
+                if elem.text and elem.tag in [
+                    "Paragraph",
+                    "Title",
+                    "Caption",
+                    "Header",
+                    "Footer",
+                ]:
+                    t = elem.text.strip()
+                    if t and not self._is_header_footer(t, elem.get("page_num")):
+                        all_texts.append(t)
+
+        combined = "\n".join(all_texts)
+        total_len = len(combined)
+
+        # 处理偏移量和窗口
+        actual_start = min(char_offset, total_len)
+        actual_end = min(char_offset + char_limit, total_len)
+        is_end_of_doc = actual_end >= total_len
+
+        text_snippet = combined[actual_start:actual_end]
+
+        return text_snippet, actual_start, actual_end, is_end_of_doc
+
     def _call_llm(self, messages, max_tokens=None, temperature=None, **kwargs):
         """公共方法：调用LLM API"""
         return self.client.chat.completions.create(
@@ -165,17 +247,44 @@ class DocAgent:
             messages=messages,
             max_tokens=max_tokens or self.max_tokens,
             temperature=temperature if temperature is not None else self.temperature,
-            **kwargs
+            **kwargs,
         )
 
     def _extract_thinking(self, raw_content):
         """从响应中提取thinking部分"""
-        thinking_match = re.search(r"<thinking>(.*?)</thinking>", raw_content, re.DOTALL)
+        thinking_match = re.search(
+            r"<thinking>(.*?)</thinking>", raw_content, re.DOTALL
+        )
         return thinking_match.group(1).strip() if thinking_match else ""
 
-    def _run_simple_review(self, prompt_template):
+    def _run_simple_review(
+        self, prompt_template, from_abstract=False, char_offset=0, char_limit=6000
+    ):
+        """
+        from_abstract: 若为 True，正文片段仅从「摘要」及之后抽取，与 Logic/Vision Agent 起点对齐。
+        char_offset: 正文片段的起始偏移量（用于滑动窗口）
+        char_limit: 正文片段的窗口大小
+
+        Returns:
+            dict: {
+                "raw": LLM 返回的原始 JSON 字符串,
+                "thinking": 提取的思考过程,
+                "window_info": {"start": int, "end": int, "is_end": bool}  # 窗口信息
+            }
+        """
         outline_xml = self.get_outline()
-        body_text = self._extract_plain_text()
+
+        if from_abstract:
+            body_text, actual_start, actual_end, is_end = (
+                self._extract_plain_text_from_abstract(
+                    char_limit=char_limit, char_offset=char_offset
+                )
+            )
+            window_info = {"start": actual_start, "end": actual_end, "is_end": is_end}
+        else:
+            body_text = self._extract_plain_text(char_limit=char_limit)
+            window_info = {"start": 0, "end": len(body_text), "is_end": True}
+
         messages = [
             {"role": "system", "content": prompt_template},
             {
@@ -186,10 +295,19 @@ class DocAgent:
         try:
             response = self._call_llm(messages, max_tokens=1500, temperature=0.0)
             raw_content = response.choices[0].message.content
-            return {"raw": raw_content, "thinking": self._extract_thinking(raw_content)}
+            return {
+                "raw": raw_content,
+                "thinking": self._extract_thinking(raw_content),
+                "window_info": window_info,
+            }
         except Exception as e:
             print(traceback.format_exc())
-            return {"raw": "", "thinking": "", "error": str(e)}
+            return {
+                "raw": "",
+                "thinking": "",
+                "error": str(e),
+                "window_info": window_info,
+            }
 
     def _parse_json(self, raw_content):
         """Helper to safely extract and parse JSON from LLM response."""
@@ -225,7 +343,7 @@ class DocAgent:
 
             # 尝试修复截断的JSON
             # 检查是否被截断（最后一个字符不是 } 或 ]）
-            if cleaned and cleaned[-1] not in '}]':
+            if cleaned and cleaned[-1] not in "}]":
                 print("[Warning] JSON appears to be truncated, attempting to fix...")
 
                 # 尝试闭合未完成的字符串
@@ -235,16 +353,18 @@ class DocAgent:
 
                 # 尝试闭合数组和对象
                 # 计算需要闭合的括号
-                open_braces = cleaned.count('{') - cleaned.count('}')
-                open_brackets = cleaned.count('[') - cleaned.count(']')
+                open_braces = cleaned.count("{") - cleaned.count("}")
+                open_brackets = cleaned.count("[") - cleaned.count("]")
 
                 # 按相反顺序添加闭合括号
                 for _ in range(open_brackets):
-                    cleaned += ']'
+                    cleaned += "]"
                 for _ in range(open_braces):
-                    cleaned += '}'
+                    cleaned += "}"
 
-                print(f"[Fix] Attempted to close {open_brackets} brackets and {open_braces} braces")
+                print(
+                    f"[Fix] Attempted to close {open_brackets} brackets and {open_braces} braces"
+                )
 
             # 移除字符串值中的换行符和特殊字符（改进版）
             # 使用更强大的方法：先识别 JSON 字符串边界
@@ -285,7 +405,7 @@ class DocAgent:
                 escape_next = False
                 continue
 
-            if char == '\\':
+            if char == "\\":
                 current_string.append(char)
                 escape_next = True
             elif char == '"':
@@ -296,16 +416,16 @@ class DocAgent:
                 else:
                     # 字符串开始
                     in_string = True
-            elif char in '\n\r\t' and in_string:
+            elif char in "\n\r\t" and in_string:
                 # 在字符串内，将换行符和制表符替换为空格
-                current_string.append(' ')
-            elif char == '\n' and not in_string:
+                current_string.append(" ")
+            elif char == "\n" and not in_string:
                 # 在 JSON 结构中，直接保留（会被 JSON 解析器忽略）
                 current_string.append(char)
             else:
                 current_string.append(char)
 
-        return ''.join(current_string)
+        return "".join(current_string)
 
     def _find_page_by_quote(self, quote_text, min_len=10):
         """
@@ -574,11 +694,10 @@ class DocAgent:
             max_workers=max_workers,
         )
 
-    def run_normative_logic_review(self):
-        """规范+逻辑简审代理包装（逻辑由 LogicAgent 负责）。"""
-        from .logic_agent import LogicAgent
-
-        return LogicAgent(self).run_normative_logic_review()
+    # NOTE: run_normative_logic_review() has been removed
+    # This method is deprecated as normative and logic reviews have been separated
+    # into NormativeAgent and LogicAgent respectively.
+    # Use run_normative_review() and run_logic_review() separately instead.
 
     def get_outline(self):
 
@@ -673,11 +792,11 @@ class DocAgent:
 
         try:
             response = self._call_llm(
-                messages, 
+                messages,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 tools=tools,
-                tool_choice="auto"
+                tool_choice="auto",
             )
 
             # limit the number of tools called in one turn
@@ -728,7 +847,7 @@ class DocAgent:
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     tools=tools,
-                    tool_choice=tool_choice
+                    tool_choice=tool_choice,
                 )
 
                 # limit the number of tools called in one turn

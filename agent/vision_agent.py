@@ -6,19 +6,391 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from .prompts import (
+    argument_role_prompt,
+    image_capacity_prompt,
+    local_stage_alignment_prompt,
+)
 
-from .modification_advisor import (
-    build_llm_instruction,
-    build_suggestion_prompt,
-    decide_modification_target,
-)
-from .prompts import argument_role_prompt, image_capacity_prompt, local_stage_alignment_prompt
-from .stage_resolver import (
-    StageResolver,
-    is_metric_chart,
-    is_method_diagram,
-    normalize_image_type,
-)
+MODIFY_FIGURE = "MODIFY_FIGURE"
+MODIFY_TEXT = "MODIFY_TEXT"
+BOTH_LIGHT = "BOTH_LIGHT"
+
+METRIC_IMAGE_TYPES = {
+    "metric_curve",
+    "quantitative_plot",
+    "evaluation_chart",
+    "bar_chart",
+    "table",
+}
+METHOD_IMAGE_TYPES = {
+    "method_diagram",
+    "architecture_diagram",
+    "flowchart",
+    "framework_diagram",
+}
+
+
+def _clamp_strength(value: Optional[float], default: float = 0.5) -> float:
+    if value is None:
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return default
+    if num < 0:
+        return 0.0
+    if num > 1:
+        return 1.0
+    return num
+
+
+def decide_modification_target(
+    figure_role: str,
+    expected_stage: Optional[str],
+    actual_stage: Optional[str],
+    text_claim_strength: Optional[float],
+    image_evidence_strength: Optional[float],
+    image_type: Optional[str] = None,
+    text_is_explanatory: bool = False,
+) -> Dict[str, str]:
+    """
+    Returns:
+    {
+        "modification_target": "MODIFY_FIGURE" | "MODIFY_TEXT" | "BOTH_LIGHT",
+        "reason": str
+    }
+    """
+    t_strength = _clamp_strength(text_claim_strength)
+    i_strength = _clamp_strength(image_evidence_strength)
+
+    signals: List[Dict[str, str]] = []
+
+    # Rule 0: 实验指标图 + 文字解释 → 优先改文
+    if image_type in METRIC_IMAGE_TYPES:
+        if text_is_explanatory:
+            reason = "实验指标图且文本为图像解释，优先修订文字表述"
+            return {"modification_target": MODIFY_TEXT, "reason": reason}
+
+    # Rule 1: FigureRole 优先级（最高）
+    if figure_role in ["RESULT_CLAIM", "COMPARISON_CLAIM"]:
+        if i_strength >= t_strength:
+            signals.append(
+                {
+                    "rule": "rule1",
+                    "target": MODIFY_TEXT,
+                    "detail": "RESULT/COMPARISON 角色下，图像证据强度不低于文字主张",
+                }
+            )
+        else:
+            signals.append(
+                {
+                    "rule": "rule1",
+                    "target": MODIFY_FIGURE,
+                    "detail": "RESULT/COMPARISON 角色默认优先改图",
+                }
+            )
+    elif figure_role == "METHOD_REFERENCE":
+        signals.append(
+            {
+                "rule": "rule1",
+                "target": MODIFY_TEXT,
+                "detail": "METHOD_REFERENCE 角色默认优先改文",
+            }
+        )
+    elif figure_role == "ILLUSTRATIVE":
+        signals.append(
+            {
+                "rule": "rule1",
+                "target": "",
+                "detail": "ILLUSTRATIVE 角色弱绑定，不单独决定方向",
+            }
+        )
+
+    # Rule 2: Stage 不一致修正
+    if expected_stage == "EVIDENCE" and actual_stage == "METHOD":
+        signals.append(
+            {
+                "rule": "rule2",
+                "target": MODIFY_FIGURE,
+                "detail": "期望 EVIDENCE 但实际为 METHOD",
+            }
+        )
+    elif expected_stage == "METHOD" and actual_stage == "EVIDENCE":
+        signals.append(
+            {
+                "rule": "rule2",
+                "target": MODIFY_TEXT,
+                "detail": "期望 METHOD 但实际为 EVIDENCE",
+            }
+        )
+
+    # Rule 3: 主张强度对比
+    if t_strength > i_strength:
+        signals.append(
+            {
+                "rule": "rule3",
+                "target": MODIFY_FIGURE,
+                "detail": "文字主张强度高于图像证据",
+            }
+        )
+    elif i_strength > t_strength:
+        signals.append(
+            {
+                "rule": "rule3",
+                "target": MODIFY_TEXT,
+                "detail": "图像证据强度高于文字主张",
+            }
+        )
+
+    targets = [s["target"] for s in signals if s.get("target")]
+    unique_targets = sorted(set(targets))
+
+    if not targets:
+        reason = f"信号不足，无法稳定决策。strengths(text={t_strength:.2f}, image={i_strength:.2f})"
+        return {"modification_target": BOTH_LIGHT, "reason": reason}
+
+    if len(unique_targets) > 1:
+        detail = "; ".join(
+            [
+                f"{s['rule']}→{s['target']}({s['detail']})"
+                for s in signals
+                if s.get("target")
+            ]
+        )
+        reason = f"规则存在冲突，采用轻微修改策略。{detail}"
+        return {"modification_target": BOTH_LIGHT, "reason": reason}
+
+    decision = unique_targets[0]
+    detail = "; ".join(
+        [f"{s['rule']}({s['detail']})" for s in signals if s.get("target")]
+    )
+    reason = f"决策={decision}。{detail}。strengths(text={t_strength:.2f}, image={i_strength:.2f})"
+    return {"modification_target": decision, "reason": reason}
+
+
+def build_llm_instruction(modification_target: str) -> Dict[str, str]:
+    if modification_target == MODIFY_TEXT:
+        return {
+            "focus": "text",
+            "constraint": "只提出文本相关的修改建议，不要建议修改图像。",
+        }
+    if modification_target == MODIFY_FIGURE:
+        return {
+            "focus": "figure",
+            "constraint": "只提出图像/图表相关的修改建议，不要建议修改文本。",
+        }
+    return {
+        "focus": "both",
+        "constraint": "只提出轻微一致性调整，避免建议大幅改动。",
+    }
+
+
+def build_suggestion_prompt(context: Dict[str, Any], decision: Dict[str, str]) -> str:
+    llm_instruction = build_llm_instruction(
+        decision.get("modification_target", BOTH_LIGHT)
+    )
+    parts = [
+        "你是一名严格的论文图文一致性审稿人。",
+        "请基于以下结构化信息生成一条简洁、可执行的修改建议。",
+        f"决策方向: {decision.get('modification_target')}",
+        f"决策理由: {decision.get('reason')}",
+    ]
+
+    if context.get("figure_role"):
+        parts.append(f"FigureRole: {context.get('figure_role')}")
+    if context.get("expected_stage") or context.get("actual_stage"):
+        parts.append(
+            f"Stage: expected={context.get('expected_stage')} actual={context.get('actual_stage')}"
+        )
+    if (
+        context.get("text_claim_strength") is not None
+        or context.get("image_evidence_strength") is not None
+    ):
+        parts.append(
+            "Strengths: "
+            f"text={context.get('text_claim_strength')}, "
+            f"image={context.get('image_evidence_strength')}"
+        )
+    if context.get("quote"):
+        parts.append(f"问题描述/引用: {context.get('quote')}")
+
+    parts.append(f"约束: {llm_instruction.get('constraint')}")
+    parts.append("输出要求：仅返回建议文本，不要输出JSON或其他格式。")
+    return "\n".join(parts)
+
+
+@dataclass
+class StageResolution:
+    final_stage: str
+    votes: Dict[str, Any]
+    image_type: Optional[str] = None
+
+
+def is_metric_chart(image_type: Optional[str]) -> bool:
+    return image_type in METRIC_IMAGE_TYPES
+
+
+def is_method_diagram(image_type: Optional[str]) -> bool:
+    return image_type in METHOD_IMAGE_TYPES
+
+
+def normalize_image_type(
+    raw_type: Optional[str], context_text: str = ""
+) -> Optional[str]:
+    raw = (raw_type or "").strip().lower()
+    text = (context_text or "").lower()
+
+    def has_any(keywords):
+        return any(k in raw or k in text for k in keywords)
+
+    if has_any(
+        [
+            "precision",
+            "recall",
+            "f1",
+            "f-score",
+            "roc",
+            "auc",
+            "loss",
+            "mAP",
+            "iou",
+            "pr curve",
+        ]
+    ):
+        return "metric_curve"
+    if has_any(["curve", "曲线", "折线", "折线图", "line chart"]):
+        return "metric_curve"
+    if has_any(["bar", "histogram", "柱状", "条形", "bar chart"]):
+        return "bar_chart"
+    if has_any(["table", "表格", "数据表"]):
+        return "table"
+    if has_any(
+        ["plot", "scatter", "scatter plot", "quantitative", "定量", "对比图", "对比"]
+    ):
+        return "quantitative_plot"
+    if has_any(
+        ["evaluation", "assessment", "performance", "评估", "评测", "性能", "实验结果"]
+    ):
+        return "evaluation_chart"
+    if has_any(["flowchart", "流程图", "流程", "步骤"]):
+        return "flowchart"
+    if has_any(["architecture", "架构", "network", "网络结构", "框架", "framework"]):
+        return "architecture_diagram"
+    if has_any(
+        ["pipeline", "method", "algorithm", "方法", "算法", "模型结构", "结构图"]
+    ):
+        return "method_diagram"
+    return None
+
+
+class StageResolver:
+    heading_weight = 0.2
+    image_weight = 0.45
+    text_role_weight = 0.65
+
+    def _infer_heading_stage(self, section_title: str) -> Optional[str]:
+        title = (section_title or "").lower()
+        if any(
+            k in title
+            for k in ["训练", "构建", "算法", "training", "build", "algorithm"]
+        ):
+            return "METHOD"
+        if any(
+            k in title
+            for k in [
+                "评估",
+                "实验",
+                "结果",
+                "性能",
+                "evaluation",
+                "experiment",
+                "result",
+                "performance",
+            ]
+        ):
+            return "EVIDENCE"
+        return None
+
+    def _infer_image_stage(self, image_type: Optional[str]) -> Optional[str]:
+        if is_metric_chart(image_type):
+            return "EVIDENCE"
+        if is_method_diagram(image_type):
+            return "METHOD"
+        return None
+
+    def _infer_text_role_stage(self, text_role: str) -> Optional[str]:
+        role = (text_role or "").strip().upper()
+        if role in ["RESULT_CLAIM", "COMPARISON_CLAIM"]:
+            return "EVIDENCE"
+        if role == "METHOD_REFERENCE":
+            return "METHOD"
+        return None
+
+    def _weighted_vote(
+        self,
+        heading_stage: Optional[str],
+        image_stage: Optional[str],
+        text_role_stage: Optional[str],
+    ) -> Tuple[str, Dict[str, Any]]:
+        scores = {"METHOD": 0.0, "EVIDENCE": 0.0}
+
+        def add(stage: Optional[str], weight: float):
+            if stage in scores:
+                scores[stage] += weight
+
+        add(heading_stage, self.heading_weight)
+        add(image_stage, self.image_weight)
+        add(text_role_stage, self.text_role_weight)
+
+        max_score = max(scores.values()) if scores else 0.0
+        if max_score == 0.0:
+            final_stage = "UNKNOWN"
+        else:
+            final_stage = (
+                "EVIDENCE" if scores["EVIDENCE"] >= scores["METHOD"] else "METHOD"
+            )
+
+        votes = {
+            "heading": {"stage": heading_stage, "weight": self.heading_weight},
+            "image": {"stage": image_stage, "weight": self.image_weight},
+            "text_role": {"stage": text_role_stage, "weight": self.text_role_weight},
+            "scores": scores,
+        }
+        return final_stage, votes
+
+    def resolve(
+        self,
+        section_title: str,
+        image_type: Optional[str],
+        text_role: str,
+    ) -> StageResolution:
+        heading_stage = self._infer_heading_stage(section_title)
+        image_stage = self._infer_image_stage(image_type)
+        text_role_stage = self._infer_text_role_stage(text_role)
+
+        # 标题仅为弱信号：若无图像与文本强信号，则不判定
+        if image_stage is None and text_role_stage is None:
+            final_stage = "UNKNOWN"
+            votes = {
+                "heading": {"stage": heading_stage, "weight": self.heading_weight},
+                "image": {"stage": image_stage, "weight": self.image_weight},
+                "text_role": {
+                    "stage": text_role_stage,
+                    "weight": self.text_role_weight,
+                },
+                "scores": {"METHOD": 0.0, "EVIDENCE": 0.0},
+            }
+            return StageResolution(
+                final_stage=final_stage, votes=votes, image_type=image_type
+            )
+
+        final_stage, votes = self._weighted_vote(
+            heading_stage, image_stage, text_role_stage
+        )
+        return StageResolution(
+            final_stage=final_stage, votes=votes, image_type=image_type
+        )
 
 
 @dataclass
@@ -111,7 +483,9 @@ class VisionAgent:
     ) -> Optional[str]:
         raw_type = None
         if image_capacity and isinstance(image_capacity.raw, dict):
-            raw_type = image_capacity.raw.get("image_type") or image_capacity.raw.get("type")
+            raw_type = image_capacity.raw.get("image_type") or image_capacity.raw.get(
+                "type"
+            )
         context_text = " ".join(
             [
                 figure_node.caption or "",
@@ -121,7 +495,9 @@ class VisionAgent:
         )
         return normalize_image_type(raw_type, context_text)
 
-    def _is_explanatory_reference(self, figure_node: FigureNode, role_assignment: RoleAssignment) -> bool:
+    def _is_explanatory_reference(
+        self, figure_node: FigureNode, role_assignment: RoleAssignment
+    ) -> bool:
         sentence = self._select_reference_sentence(figure_node, role_assignment)
         if not sentence:
             return False
@@ -165,7 +541,9 @@ class VisionAgent:
             return None
         if role_assignment.role not in ["RESULT_CLAIM", "COMPARISON_CLAIM"]:
             return None
-        reference_sentence = self._select_reference_sentence(figure_node, role_assignment)
+        reference_sentence = self._select_reference_sentence(
+            figure_node, role_assignment
+        )
         if not self._has_generalization_language(reference_sentence):
             return None
         return {
@@ -199,13 +577,29 @@ class VisionAgent:
         )
 
         issues: List[Dict[str, Any]] = []
+        thinking_parts: List[str] = []
         for res in res_list:
             if isinstance(res, dict):
-                issues.extend([iss for iss in res.get("issues", []) if isinstance(iss, dict)])
+                issues.extend(
+                    [iss for iss in res.get("issues", []) if isinstance(iss, dict)]
+                )
+                # 汇总单图决策轨迹供报告展示
+                fid = res.get("figure_id", "")
+                trace = res.get("decision_trace", [])
+                if fid and trace:
+                    thinking_parts.append(
+                        f"**{fid}**\n" + "\n".join(f"- {t}" for t in trace[:20])
+                    )
+        thinking_log = "=== 视觉审查（逐图 ARG 分析）===\n\n" + (
+            "\n\n".join(thinking_parts[:30])
+            if thinking_parts
+            else "（无逐条决策轨迹记录，详见下方问题列表）"
+        )
 
         return {
             "raw": res_list,
             "parsed": {"issues": issues},
+            "thinking": thinking_log,
             "errors": [],
         }
 
@@ -240,7 +634,9 @@ class VisionAgent:
 
         return figure_node
 
-    def _build_table_node(self, table_id: str, table_info: Dict) -> Optional[FigureNode]:
+    def _build_table_node(
+        self, table_id: str, table_info: Dict
+    ) -> Optional[FigureNode]:
         page_num = table_info.get("page_num")
         caption = table_info.get("caption", "")
 
@@ -321,7 +717,9 @@ class VisionAgent:
                 if re.search(pattern, sentence, re.IGNORECASE):
                     cleaned = sentence.strip()
                     if cleaned:
-                        references.append(TextReference(sentence=cleaned, figure_id=img_id))
+                        references.append(
+                            TextReference(sentence=cleaned, figure_id=img_id)
+                        )
                     break
 
         return references
@@ -355,7 +753,9 @@ class VisionAgent:
                 if re.search(pattern, sentence, re.IGNORECASE):
                     cleaned = sentence.strip()
                     if cleaned:
-                        references.append(TextReference(sentence=cleaned, figure_id=table_id))
+                        references.append(
+                            TextReference(sentence=cleaned, figure_id=table_id)
+                        )
                     break
 
         return references
@@ -373,7 +773,9 @@ class VisionAgent:
             sentences.append(parts[-1].strip())
         return sentences
 
-    def _extract_scope_keywords(self, caption_text: str, image_capacity: ImageCapacity) -> List[str]:
+    def _extract_scope_keywords(
+        self, caption_text: str, image_capacity: ImageCapacity
+    ) -> List[str]:
         raw_text = caption_text or ""
         keywords: List[str] = []
         for token in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", raw_text):
@@ -396,7 +798,13 @@ class VisionAgent:
     def _contains_figure_or_table_ref(self, sentence: str) -> bool:
         if not sentence:
             return False
-        return bool(re.search(r"(图|圖|figure|fig\.?|表|table|tab\.?)\s*[\d\-\.]+", sentence, re.IGNORECASE))
+        return bool(
+            re.search(
+                r"(图|圖|figure|fig\.?|表|table|tab\.?)\s*[\d\-\.]+",
+                sentence,
+                re.IGNORECASE,
+            )
+        )
 
     def _is_heading_like(self, sentence: str) -> bool:
         if not sentence:
@@ -456,7 +864,11 @@ class VisionAgent:
         i = ref_idx - 1
         while i >= 0:
             s = sentences[i]
-            if self._is_heading_like(s) or self._contains_figure_or_table_ref(s) or self._is_topic_switch(s):
+            if (
+                self._is_heading_like(s)
+                or self._contains_figure_or_table_ref(s)
+                or self._is_topic_switch(s)
+            ):
                 trace.append(f"backward_stop_at:{s[:20]}")
                 break
             scope_indices.insert(0, i)
@@ -476,7 +888,11 @@ class VisionAgent:
         no_keyword_streak = 0
         for j in range(ref_idx + 1, len(sentences)):
             s = sentences[j]
-            if self._is_heading_like(s) or self._contains_figure_or_table_ref(s) or self._is_topic_switch(s):
+            if (
+                self._is_heading_like(s)
+                or self._contains_figure_or_table_ref(s)
+                or self._is_topic_switch(s)
+            ):
                 trace.append(f"forward_stop_at:{s[:20]}")
                 break
             trigger = None
@@ -505,13 +921,19 @@ class VisionAgent:
                 trace.append("forward_stop:keyword_miss_streak")
                 break
 
-        scope_text = "\n".join([sentences[i] for i in scope_indices if sentences[i].strip()])
+        scope_text = "\n".join(
+            [sentences[i] for i in scope_indices if sentences[i].strip()]
+        )
         scope_confidence = 0.6
         if len(scope_indices) > 1:
             scope_confidence += 0.1
         if any("forward_extension_triggered_by" in t for t in trace):
             scope_confidence += 0.1
-        if any(t.startswith("keyword_overlap") and float(t.split(":")[1]) >= 0.3 for t in trace if ":" in t):
+        if any(
+            t.startswith("keyword_overlap") and float(t.split(":")[1]) >= 0.3
+            for t in trace
+            if ":" in t
+        ):
             scope_confidence += 0.1
         scope_confidence = max(0.0, min(1.0, scope_confidence))
 
@@ -636,16 +1058,32 @@ class VisionAgent:
 
     def _map_section_stage(self, section_title: str) -> str:
         title = (section_title or "").lower()
-        if any(k in title for k in ["introduction", "background", "绪论", "引言", "背景"]):
+        if any(
+            k in title for k in ["introduction", "background", "绪论", "引言", "背景"]
+        ):
             return "PROBLEM"
-        if any(k in title for k in ["method", "model", "approach", "training", "方法", "模型", "算法"]):
+        if any(
+            k in title
+            for k in ["method", "model", "approach", "training", "方法", "模型", "算法"]
+        ):
             return "METHOD"
         if any(
             k in title
-            for k in ["experiment", "result", "results", "evaluation", "assessment", "实验", "结果", "评测"]
+            for k in [
+                "experiment",
+                "result",
+                "results",
+                "evaluation",
+                "assessment",
+                "实验",
+                "结果",
+                "评测",
+            ]
         ):
             return "EVIDENCE"
-        if any(k in title for k in ["discussion", "conclusion", "讨论", "结论", "总结"]):
+        if any(
+            k in title for k in ["discussion", "conclusion", "讨论", "结论", "总结"]
+        ):
             return "INTERPRETATION"
         return "UNKNOWN"
 
@@ -658,7 +1096,9 @@ class VisionAgent:
             return None
         return None
 
-    def _mismatch_severity(self, role: str, actual_stage: str, image_type: Optional[str]) -> str:
+    def _mismatch_severity(
+        self, role: str, actual_stage: str, image_type: Optional[str]
+    ) -> str:
         if role == "RESULT_CLAIM" and actual_stage == "METHOD":
             if is_method_diagram(image_type):
                 return "High"
@@ -697,7 +1137,9 @@ class VisionAgent:
                     hits += 1
         return hits
 
-    def _infer_stage_by_sentence(self, sentence: str) -> Tuple[str, float, Dict[str, int]]:
+    def _infer_stage_by_sentence(
+        self, sentence: str
+    ) -> Tuple[str, float, Dict[str, int]]:
         keywords = {
             "EVIDENCE": [
                 "metric",
@@ -747,7 +1189,10 @@ class VisionAgent:
                 "讨论",
             ],
         }
-        hits = {stage: self._keyword_hits(sentence, keys) for stage, keys in keywords.items()}
+        hits = {
+            stage: self._keyword_hits(sentence, keys)
+            for stage, keys in keywords.items()
+        }
         max_stage = max(hits, key=hits.get)
         max_count = hits[max_stage]
         if max_count == 0:
@@ -756,7 +1201,10 @@ class VisionAgent:
         return max_stage, confidence, hits
 
     def _extract_local_context_paragraphs(
-        self, section_elem: Optional[ET.Element], reference_sentence: str, max_paragraphs: int = 3
+        self,
+        section_elem: Optional[ET.Element],
+        reference_sentence: str,
+        max_paragraphs: int = 3,
     ) -> List[str]:
         if section_elem is None:
             return []
@@ -774,7 +1222,9 @@ class VisionAgent:
             combined = " ".join(section_elem.itertext()).strip()
             if not combined:
                 return []
-            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", combined) if p.strip()]
+            paragraphs = [
+                p.strip() for p in re.split(r"\n\s*\n", combined) if p.strip()
+            ]
             if not paragraphs:
                 paragraphs = [combined]
 
@@ -836,8 +1286,7 @@ class VisionAgent:
             {
                 "role": "user",
                 "content": (
-                    f"引用句子：{reference_sentence}\n"
-                    f"局部上下文：\n{context}"
+                    f"引用句子：{reference_sentence}\n" f"局部上下文：\n{context}"
                 ),
             },
         ]
@@ -897,7 +1346,9 @@ class VisionAgent:
                 "weight": 0.4,
                 "confidence": reference_conf,
                 "hits": reference_hits,
-                "contribution": 0.4 * reference_conf if reference_stage in stages else 0.0,
+                "contribution": (
+                    0.4 * reference_conf if reference_stage in stages else 0.0
+                ),
             },
             "local_context": {
                 "stage": local_stage,
@@ -919,7 +1370,9 @@ class VisionAgent:
         image_type: Optional[str],
     ) -> StageAlignment:
         section_prior_stage = self._map_section_stage(figure_node.section_title)
-        reference_sentence = self._select_reference_sentence(figure_node, role_assignment)
+        reference_sentence = self._select_reference_sentence(
+            figure_node, role_assignment
+        )
         reference_stage, reference_conf, reference_hits = self._infer_stage_by_sentence(
             reference_sentence
         )
@@ -1035,9 +1488,7 @@ class VisionAgent:
                     },
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{media_type};base64,{base64_img}"
-                        },
+                        "image_url": {"url": f"data:{media_type};base64,{base64_img}"},
                     },
                 ],
             },
@@ -1085,7 +1536,8 @@ class VisionAgent:
                     "page": figure_node.page_num,
                     "image_id": figure_node.figure_id,
                     "media_kind": media_kind,
-                    "quote": role_assignment.evidence_sentence or "未能可靠识别图像论证角色",
+                    "quote": role_assignment.evidence_sentence
+                    or "未能可靠识别图像论证角色",
                     "suggestion": "请明确图号引用句，使图像在论证中的角色更清晰。示例：将“结果如图所示”改为“如图3-11所示，Precision-Confidence曲线用于说明高置信度区间的精确率变化趋势”。",
                 }
             )
@@ -1149,10 +1601,14 @@ class VisionAgent:
 
         scope_text = image_scope_text
         scope_is_result = bool(
-            re.search(r"(结果|对比|实验|性能|准确率|召回率|精确率|F1|评测|验证)", scope_text)
+            re.search(
+                r"(结果|对比|实验|性能|准确率|召回率|精确率|F1|评测|验证)", scope_text
+            )
         )
         scope_is_method = bool(
-            re.search(r"(方法|流程|架构|系统|模块|设计|步骤|算法|模型|框架|实现)", scope_text)
+            re.search(
+                r"(方法|流程|架构|系统|模块|设计|步骤|算法|模型|框架|实现)", scope_text
+            )
         )
         image_is_method = is_method_diagram(image_type) if image_type else False
         image_is_metric = is_metric_chart(image_type) if image_type else False
@@ -1231,7 +1687,9 @@ class VisionAgent:
         text_strength, image_strength = self._compute_claim_strengths(
             role_assignment, image_capacity
         )
-        text_is_explanatory = self._is_explanatory_reference(figure_node, role_assignment)
+        text_is_explanatory = self._is_explanatory_reference(
+            figure_node, role_assignment
+        )
         decision = decide_modification_target(
             figure_role=role_assignment.role,
             expected_stage=stage_alignment.expected_stage,
@@ -1258,7 +1716,8 @@ class VisionAgent:
             "BOTH_LIGHT": "建议对图像与文字做轻微一致性调整，确保引用句与图像信息对齐。",
         }
         fallback = fallback_map.get(
-            decision.get("modification_target", "BOTH_LIGHT"), fallback_map["BOTH_LIGHT"]
+            decision.get("modification_target", "BOTH_LIGHT"),
+            fallback_map["BOTH_LIGHT"],
         )
         suggestion = self._generate_modification_suggestion(prompt_text, fallback)
 
@@ -1271,19 +1730,40 @@ class VisionAgent:
 
     def _parse_json_from_response(self, raw_content: str) -> Dict:
         result = self.doc_agent._parse_json(raw_content)
+
+        # 如果返回的是列表，尝试手动解析以获取字典
+        if isinstance(result, list):
+            # 尝试从原始内容中提取字典
+            if raw_content:
+                start = raw_content.find("{")
+                end = raw_content.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    try:
+                        dict_result = json.loads(raw_content[start : end + 1])
+                        if isinstance(dict_result, dict):
+                            return dict_result
+                    except json.JSONDecodeError:
+                        pass
+            # 如果无法提取字典，返回空字典
+            return {}
+
+        # 如果返回的是空字典且有原始内容，尝试手动解析
         if result == {"issues": []} and raw_content:
             start = raw_content.find("{")
             end = raw_content.rfind("}")
             if start != -1 and end != -1 and end > start:
                 try:
-                    return json.loads(raw_content[start : end + 1])
+                    dict_result = json.loads(raw_content[start : end + 1])
+                    if isinstance(dict_result, dict):
+                        return dict_result
                 except json.JSONDecodeError:
                     pass
-        return result if result else {}
+
+        return result if isinstance(result, dict) else {}
+
     def run_vision_review(
         self,
         vision_model_id="qwen3-vl-flash",
-        max_images=50,
         vision_api_key=None,
         vision_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         include_page_image: bool = True,
@@ -1336,48 +1816,74 @@ class VisionAgent:
                     caption_text = child.text
 
             # 向上查找 2 层父节点以处理更复杂的结构（如 Image 嵌套在 Figure 中）
-            curr_elem = elem
-            for _ in range(2):
-                parent = parent_map.get(curr_elem)
-                if not parent:
-                    break
-
-                try:
-                    children = list(parent)
-                    idx = children.index(curr_elem)
-                    if not adjacent_image:
-                        for neighbor_idx in (idx - 1, idx + 1):
-                            if 0 <= neighbor_idx < len(children):
-                                neighbor = children[neighbor_idx]
-                                if neighbor.tag == "Image":
-                                    adjacent_image = True
-                                    neighbor_id = neighbor.get("image_id")
-                                    if neighbor_id:
-                                        adjacent_image_ids.append(neighbor_id)
-                    # 扩大搜索范围（前后 5 个节点）并支持更多可能的标签
-                    search_range = 5
-                    start_idx = max(0, idx - search_range)
-                    end_idx = min(len(children), idx + search_range + 1)
-
-                    for i in range(start_idx, end_idx):
-                        if i == idx and curr_elem == elem:
-                            continue
-                        node = children[i]
-                        # 使用 itertext 确保能获取到带格式（如加粗）的标题文字
-                        text = "".join(node.itertext()).strip()
-                        if text:
-                            if self.doc_agent._is_header_footer(
-                                text, node.get("page_num") or page_num
-                            ):
-                                continue
-                            if caption_pattern.match(text):
-                                caption_text = text
-                                break
-                    if caption_text:
+            # 【重要修复】只有在caption_text为空时才搜索周围文本，避免覆盖已有的Alt_Text
+            if not caption_text:
+                curr_elem = elem
+                for _ in range(2):
+                    parent = parent_map.get(curr_elem)
+                    if not parent:
                         break
-                except ValueError:
-                    pass
-                curr_elem = parent
+
+                    try:
+                        children = list(parent)
+                        idx = children.index(curr_elem)
+                        if not adjacent_image:
+                            for neighbor_idx in (idx - 1, idx + 1):
+                                if 0 <= neighbor_idx < len(children):
+                                    neighbor = children[neighbor_idx]
+                                    if neighbor.tag == "Image":
+                                        adjacent_image = True
+                                        neighbor_id = neighbor.get("image_id")
+                                        if neighbor_id:
+                                            adjacent_image_ids.append(neighbor_id)
+                        # 扩大搜索范围（前后 5 个节点）并支持更多可能的标签
+                        search_range = 5
+                        start_idx = max(0, idx - search_range)
+                        end_idx = min(len(children), idx + search_range + 1)
+
+                        for i in range(start_idx, end_idx):
+                            if i == idx and curr_elem == elem:
+                                continue
+                            node = children[i]
+                            # 使用 itertext 确保能获取到带格式（如加粗）的标题文字
+                            text = "".join(node.itertext()).strip()
+                            if text:
+                                if self.doc_agent._is_header_footer(
+                                    text, node.get("page_num") or page_num
+                                ):
+                                    continue
+                                if caption_pattern.match(text):
+                                    caption_text = text
+                                    break
+                        if caption_text:
+                            break
+                    except ValueError:
+                        pass
+                    curr_elem = parent
+            else:
+                # 即使已有caption，仍需检测adjacent_image（用于后续判断）
+                curr_elem = elem
+                for _ in range(2):
+                    parent = parent_map.get(curr_elem)
+                    if not parent:
+                        break
+                    try:
+                        children = list(parent)
+                        idx = children.index(curr_elem)
+                        if not adjacent_image:
+                            for neighbor_idx in (idx - 1, idx + 1):
+                                if 0 <= neighbor_idx < len(children):
+                                    neighbor = children[neighbor_idx]
+                                    if neighbor.tag == "Image":
+                                        adjacent_image = True
+                                        neighbor_id = neighbor.get("image_id")
+                                        if neighbor_id:
+                                            adjacent_image_ids.append(neighbor_id)
+                        if adjacent_image:
+                            break
+                    except ValueError:
+                        pass
+                    curr_elem = parent
 
             if img_id:
                 image_filename = ""
@@ -1410,35 +1916,37 @@ class VisionAgent:
                     caption_text = child.text
                     break
 
-            curr_elem = elem
-            for _ in range(2):
-                parent = parent_map.get(curr_elem)
-                if not parent:
-                    break
-                try:
-                    children = list(parent)
-                    idx = children.index(curr_elem)
-                    search_range = 5
-                    start_idx = max(0, idx - search_range)
-                    end_idx = min(len(children), idx + search_range + 1)
-                    for i in range(start_idx, end_idx):
-                        if i == idx and curr_elem == elem:
-                            continue
-                        node = children[i]
-                        text = "".join(node.itertext()).strip()
-                        if text:
-                            if self.doc_agent._is_header_footer(
-                                text, node.get("page_num") or page_num
-                            ):
-                                continue
-                            if caption_pattern.match(text):
-                                caption_text = text
-                                break
-                    if caption_text:
+            # 【重要修复】只有在caption_text为空时才搜索周围文本，避免覆盖已有的Alt_Text
+            if not caption_text:
+                curr_elem = elem
+                for _ in range(2):
+                    parent = parent_map.get(curr_elem)
+                    if not parent:
                         break
-                except ValueError:
-                    pass
-                curr_elem = parent
+                    try:
+                        children = list(parent)
+                        idx = children.index(curr_elem)
+                        search_range = 5
+                        start_idx = max(0, idx - search_range)
+                        end_idx = min(len(children), idx + search_range + 1)
+                        for i in range(start_idx, end_idx):
+                            if i == idx and curr_elem == elem:
+                                continue
+                            node = children[i]
+                            text = "".join(node.itertext()).strip()
+                            if text:
+                                if self.doc_agent._is_header_footer(
+                                    text, node.get("page_num") or page_num
+                                ):
+                                    continue
+                                if caption_pattern.match(text):
+                                    caption_text = text
+                                    break
+                        if caption_text:
+                            break
+                    except ValueError:
+                        pass
+                    curr_elem = parent
 
             if table_id:
                 section_info = self._find_section_by_element(elem, parent_map)
@@ -1450,6 +1958,7 @@ class VisionAgent:
                     "section_info": section_info,
                 }
 
+        # 审查起点与 NormativeAgent、LogicAgent 对齐：摘要之前的章节内图片不审查
         section_order: Dict[int, int] = {}
         intro_index = None
         section_idx = 0
@@ -1462,8 +1971,10 @@ class VisionAgent:
                 if node.tag == "Heading" and node.text:
                     title_text = node.text
                     break
-            if intro_index is None and title_text and re.search(
-                r"(摘要|abstract|摘\s*要)", title_text, re.IGNORECASE
+            if (
+                intro_index is None
+                and title_text
+                and re.search(r"(摘要|abstract|摘\s*要)", title_text, re.IGNORECASE)
             ):
                 intro_index = section_idx
             section_idx += 1
@@ -1471,10 +1982,8 @@ class VisionAgent:
         count = 0
         total_images = len(self.doc_reader.image_path_dict)
         total_tables = len(self.doc_reader.table_image_path_dict)
-        total_media = total_images + total_tables
-        process_limit = min(max_images, total_media)
         print(
-            f"[Agent] 发现 {total_images} 张图片 + {total_tables} 张表格，将审查前 {process_limit} 项（ARG图文一致性）"
+            f"[Agent] 发现 {total_images} 张图片 + {total_tables} 张表格，将审查图片与表格（ARG图文一致性）"
         )
         print(
             "  → 处理流程: Step 1 (FigureNode构建) → Step 2 (Role分类) → "
@@ -1482,30 +1991,76 @@ class VisionAgent:
         )
 
         media_items = []
+        skipped_no_section = 0
+        skipped_before_intro = 0
+
         for img_id in self.doc_reader.image_path_dict.keys():
             meta = image_info_map.get(img_id, {})
             sec_info = meta.get("section_info") or {}
             sec_elem = sec_info.get("section_elem")
-            if intro_index is not None:
-                if not sec_elem:
+
+            # 如果找不到section，尝试通过页码查找
+            if not sec_elem:
+                page_num = meta.get("page_num")
+                if page_num:
+                    fallback_sec_info = self.doc_reader.find_section_by_page(page_num)
+                    if fallback_sec_info:
+                        sec_info = fallback_sec_info
+                        sec_elem = fallback_sec_info.get("section_elem")
+                        # 更新image_info_map以便后续使用
+                        image_info_map[img_id]["section_info"] = fallback_sec_info
+                        meta = image_info_map[img_id]  # 更新meta引用
+
+            # 只有在找到section且明确在摘要之前时才跳过
+            if intro_index is not None and sec_elem:
+                sec_idx = section_order.get(id(sec_elem), -1)
+                if sec_idx >= 0 and sec_idx < intro_index:
+                    skipped_before_intro += 1
                     continue
-                if section_order.get(id(sec_elem), -1) < intro_index:
-                    continue
+            # 如果找不到section，仍然处理（不跳过）
+            elif intro_index is not None and not sec_elem:
+                skipped_no_section += 1
+                # 仍然处理，但记录警告
+                print(f"[Warning] 图片 {img_id} 未找到对应章节，仍将处理")
+
             media_items.append(("image", img_id))
+
         for table_id in self.doc_reader.table_image_path_dict.keys():
             meta = table_info_map.get(table_id, {})
             sec_info = meta.get("section_info") or {}
             sec_elem = sec_info.get("section_elem")
-            if intro_index is not None:
-                if not sec_elem:
+
+            # 如果找不到section，尝试通过页码查找
+            if not sec_elem:
+                page_num = meta.get("page_num")
+                if page_num:
+                    fallback_sec_info = self.doc_reader.find_section_by_page(page_num)
+                    if fallback_sec_info:
+                        sec_info = fallback_sec_info
+                        sec_elem = fallback_sec_info.get("section_elem")
+                        # 更新table_info_map以便后续使用
+                        table_info_map[table_id]["section_info"] = fallback_sec_info
+                        meta = table_info_map[table_id]  # 更新meta引用
+
+            # 只有在找到section且明确在摘要之前时才跳过
+            if intro_index is not None and sec_elem:
+                sec_idx = section_order.get(id(sec_elem), -1)
+                if sec_idx >= 0 and sec_idx < intro_index:
+                    skipped_before_intro += 1
                     continue
-                if section_order.get(id(sec_elem), -1) < intro_index:
-                    continue
+            # 如果找不到section，仍然处理（不跳过）
+            elif intro_index is not None and not sec_elem:
+                skipped_no_section += 1
+                # 仍然处理，但记录警告
+                print(f"[Warning] 表格 {table_id} 未找到对应章节，仍将处理")
+
             media_items.append(("table", table_id))
 
+        if skipped_before_intro > 0:
+            print(f"[Debug] 过滤统计: 跳过摘要前的媒体 {skipped_before_intro} 个")
+        print(f"[Debug] 将处理 {len(media_items)} 个媒体项（图片+表格）")
+
         for media_kind, media_id in media_items:
-            if count >= max_images:
-                break
 
             if media_kind == "table":
                 meta = table_info_map.get(
@@ -1537,9 +2092,13 @@ class VisionAgent:
 
             try:
                 if media_kind == "table":
-                    figure_node = self._build_table_node(table_id=media_id, table_info=meta)
+                    figure_node = self._build_table_node(
+                        table_id=media_id, table_info=meta
+                    )
                 else:
-                    figure_node = self._build_figure_node(img_id=media_id, image_info=meta)
+                    figure_node = self._build_figure_node(
+                        img_id=media_id, image_info=meta
+                    )
                 if not figure_node:
                     results.append(
                         {
@@ -1554,12 +2113,14 @@ class VisionAgent:
                     count += 1
                     continue
 
-                scope_text, scope_confidence, scope_trace = self._build_image_semantic_scope(
-                    figure_node=figure_node,
-                    caption_text=meta.get("caption", ""),
-                    image_capacity=ImageCapacity(
-                        role="UNKNOWN", sufficient=False, reason="", raw={}
-                    ),
+                scope_text, scope_confidence, scope_trace = (
+                    self._build_image_semantic_scope(
+                        figure_node=figure_node,
+                        caption_text=meta.get("caption", ""),
+                        image_capacity=ImageCapacity(
+                            role="UNKNOWN", sufficient=False, reason="", raw={}
+                        ),
+                    )
                 )
                 figure_node.image_scope_text = scope_text
                 figure_node.scope_confidence = scope_confidence
@@ -1577,10 +2138,12 @@ class VisionAgent:
                     image_scope_text=figure_node.image_scope_text,
                 )
                 # refresh scope keywords using image_capacity raw
-                scope_text, scope_confidence, scope_trace = self._build_image_semantic_scope(
-                    figure_node=figure_node,
-                    caption_text=meta.get("caption", ""),
-                    image_capacity=image_capacity,
+                scope_text, scope_confidence, scope_trace = (
+                    self._build_image_semantic_scope(
+                        figure_node=figure_node,
+                        caption_text=meta.get("caption", ""),
+                        image_capacity=image_capacity,
+                    )
                 )
                 figure_node.image_scope_text = scope_text
                 figure_node.scope_confidence = scope_confidence
@@ -1589,7 +2152,9 @@ class VisionAgent:
                 image_type = self._infer_image_type(
                     figure_node, role_assignment, image_capacity
                 )
-                stage_alignment = self._align_stage(figure_node, role_assignment, image_type)
+                stage_alignment = self._align_stage(
+                    figure_node, role_assignment, image_type
+                )
                 issues = self._judge_aggregate(
                     figure_node,
                     role_assignment,
@@ -1645,7 +2210,9 @@ class VisionAgent:
                     consistency_result=consistency_result,
                     modification_target=modification_target,
                     modification_suggestion=modification_suggestion,
-                    decision_trace=list(dict.fromkeys(figure_node.decision_trace + decision_trace)),
+                    decision_trace=list(
+                        dict.fromkeys(figure_node.decision_trace + decision_trace)
+                    ),
                     raw_debug={
                         "references": [asdict(r) for r in figure_node.references],
                         "role_raw": role_assignment.raw,
@@ -1678,7 +2245,6 @@ class VisionAgent:
     def run_vision_review_parallel(
         self,
         vision_model_id="qwen3-vl-flash",
-        max_images=50,
         vision_api_key=None,
         vision_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         max_workers=3,

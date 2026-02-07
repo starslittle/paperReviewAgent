@@ -12,7 +12,6 @@ import re
 import xml.etree.ElementTree as ET
 
 import pandas as pd
-from PIL import Image
 
 try:
     from .doc_ir import DocIR, DocIRMeta, FigureNode, SectionNode, TableNode, TextBlock
@@ -110,19 +109,10 @@ class DocIRBuilder:
                 return [float(v) for v in parsed[:4]]
         return None
 
-    def _compute_page_bbox_max(
-        self, data: pd.DataFrame
-    ) -> Dict[int, Tuple[float, float]]:
-        page_bbox_max: Dict[int, Tuple[float, float]] = {}
-        for _, row in data.iterrows():
-            bbox = self._parse_bbox(row.get("bbox"))
-            if not bbox:
-                continue
-            page_idx = int(row.get("page_idx", 0))
-            _, _, x2, y2 = bbox
-            max_x, max_y = page_bbox_max.get(page_idx, (0.0, 0.0))
-            page_bbox_max[page_idx] = (max(max_x, x2), max(max_y, y2))
-        return page_bbox_max
+    def _bbox_to_str(self, bbox: Optional[List[float]]) -> Optional[str]:
+        if not bbox or len(bbox) < 4:
+            return None
+        return ",".join(f"{v:.2f}" for v in bbox[:4])
 
     def _get_heading_level(self, text: str, has_triple_numbering: bool) -> int:
         """根据标题文本识别层级"""
@@ -158,7 +148,16 @@ class DocIRBuilder:
         if not cleaned:
             return None
         # 避免误判超长正文
-        if len(cleaned) > 40:
+        if len(cleaned) > 35:
+            return None
+
+        # 句末标点通常表示正文句子
+        if cleaned[-1] in "。；，.!?;,":
+            return None
+
+        # 过多逗号一般是正文
+        comma_count = cleaned.count("，") + cleaned.count(",")
+        if comma_count >= 2:
             return None
 
         if re.match(r"^第\s*[一二三四五六七八九十百0-9]+\s*章", cleaned):
@@ -195,25 +194,6 @@ class DocIRBuilder:
 
         image_count, table_count, para_count = 0, 0, 0
         root = ET.Element("Document")
-        page_bbox_max = self._compute_page_bbox_max(data)
-        page_image_cache: Dict[int, Image.Image] = {}
-        page_images_dir = os.path.join(data_path, "page_images")
-        table_images_dir = os.path.join(data_path, "table_images")
-        pad_ratio = float(os.getenv("TABLE_CROP_PAD_RATIO", "0.002"))
-        pad_px = int(os.getenv("TABLE_CROP_PAD_PX", "1"))
-        header_footer_repeat_threshold = int(
-            os.getenv("HEADER_FOOTER_REPEAT_PAGES", "3")
-        )
-        header_footer_top_bottom_n = int(os.getenv("HEADER_FOOTER_TOP_BOTTOM_N", "2"))
-        header_footer_max_len = int(os.getenv("HEADER_FOOTER_MAX_LEN", "120"))
-        header_regex = re.compile(
-            r"(第\s*\d+\s*页|页码|学院|专业|指导教师|学校|论文|本科|毕业|\d{4}\s*年)",
-            re.IGNORECASE,
-        )
-        footer_regex = re.compile(
-            r"^(第\s*\d+\s*页|\d+\s*页|\d+\s*/\s*\d+|\d+)$",
-            re.IGNORECASE,
-        )
         toc_title_tokens = {"目录", "contents", "tableofcontents"}
 
         def _is_table_caption(text: str) -> bool:
@@ -240,10 +220,13 @@ class DocIRBuilder:
                 )
             )
 
+        def _normalize_caption_text(text: str) -> str:
+            return re.sub(r"\s+", " ", str(text)).strip()
+
         def _build_table_caption_index(
             df: pd.DataFrame,
-        ) -> Dict[int, List[Tuple[int, str]]]:
-            table_captions: Dict[int, List[Tuple[int, str]]] = {}
+        ) -> Dict[int, List[Tuple[int, str, Optional[List[float]]]]]:
+            table_captions: Dict[int, List[Tuple[int, str, Optional[List[float]]]]] = {}
             for idx, row in df.iterrows():
                 para = row.get("para_text", "")
                 if not isinstance(para, str):
@@ -253,16 +236,19 @@ class DocIRBuilder:
                     continue
                 if not _is_table_caption(text):
                     continue
-                text = re.sub(r"\s+", " ", text).strip()
+                text = _normalize_caption_text(text)
+                bbox = self._parse_bbox(row.get("bbox"))
                 page_idx = row.get("page_idx", 0)
                 page_num = page_idx + 1
-                table_captions.setdefault(page_num, []).append((idx, text))
+                table_captions.setdefault(page_num, []).append((idx, text, bbox))
             return table_captions
 
         def _build_figure_caption_index(
             df: pd.DataFrame,
-        ) -> Dict[int, List[Tuple[int, str]]]:
-            figure_captions: Dict[int, List[Tuple[int, str]]] = {}
+        ) -> Dict[int, List[Tuple[int, str, Optional[List[float]]]]]:
+            figure_captions: Dict[int, List[Tuple[int, str, Optional[List[float]]]]] = (
+                {}
+            )
             for idx, row in df.iterrows():
                 para = row.get("para_text", "")
                 if not isinstance(para, str):
@@ -272,66 +258,64 @@ class DocIRBuilder:
                     continue
                 if not _is_figure_caption(text):
                     continue
-                text = re.sub(r"\s+", " ", text).strip()
+                text = _normalize_caption_text(text)
+                bbox = self._parse_bbox(row.get("bbox"))
                 page_idx = row.get("page_idx", 0)
                 page_num = page_idx + 1
-                figure_captions.setdefault(page_num, []).append((idx, text))
+                figure_captions.setdefault(page_num, []).append((idx, text, bbox))
             return figure_captions
 
         def _find_nearest_table_caption(
             page_num: int,
             row_idx: int,
-            table_captions: Dict[int, List[Tuple[int, str]]],
-        ) -> Optional[str]:
+            table_captions: Dict[int, List[Tuple[int, str, Optional[List[float]]]]],
+        ) -> Optional[Tuple[str, Optional[List[float]]]]:
             same_page = table_captions.get(page_num, [])
             if same_page:
-                _, best_text = min(
-                    ((abs(idx - row_idx), text) for idx, text in same_page),
+                _, best_text, best_bbox = min(
+                    ((abs(idx - row_idx), text, bbox) for idx, text, bbox in same_page),
                     key=lambda x: x[0],
                 )
-                return best_text
-            candidates: List[Tuple[int, str]] = []
+                return best_text, best_bbox
+            candidates: List[Tuple[int, str, Optional[List[float]]]] = []
             for p in [page_num - 1, page_num + 1]:
                 if p < 1:
                     continue
-                for idx, text in table_captions.get(p, []):
+                for idx, text, bbox in table_captions.get(p, []):
                     score = abs(idx - row_idx) + 1000
-                    candidates.append((score, text))
+                    candidates.append((score, text, bbox))
             if not candidates:
                 return None
-            best_score, best_text = min(candidates, key=lambda x: x[0])
+            best_score, best_text, best_bbox = min(candidates, key=lambda x: x[0])
             if best_score < 1200:
-                return best_text
+                return best_text, best_bbox
             return None
 
         def _find_nearest_figure_caption(
             page_num: int,
             row_idx: int,
-            figure_captions: Dict[int, List[Tuple[int, str]]],
-        ) -> Optional[str]:
+            figure_captions: Dict[int, List[Tuple[int, str, Optional[List[float]]]]],
+        ) -> Optional[Tuple[str, Optional[List[float]]]]:
             same_page = figure_captions.get(page_num, [])
             if same_page:
-                _, best_text = min(
-                    ((abs(idx - row_idx), text) for idx, text in same_page),
+                _, best_text, best_bbox = min(
+                    ((abs(idx - row_idx), text, bbox) for idx, text, bbox in same_page),
                     key=lambda x: x[0],
                 )
-                return best_text
-            candidates: List[Tuple[int, str]] = []
+                return best_text, best_bbox
+            candidates: List[Tuple[int, str, Optional[List[float]]]] = []
             for p in [page_num - 1, page_num + 1]:
                 if p < 1:
                     continue
-                for idx, text in figure_captions.get(p, []):
+                for idx, text, bbox in figure_captions.get(p, []):
                     score = abs(idx - row_idx) + 1000
-                    candidates.append((score, text))
+                    candidates.append((score, text, bbox))
             if not candidates:
                 return None
-            best_score, best_text = min(candidates, key=lambda x: x[0])
+            best_score, best_text, best_bbox = min(candidates, key=lambda x: x[0])
             if best_score < 1200:
-                return best_text
+                return best_text, best_bbox
             return None
-
-        def _normalize_header_footer_text(text: str) -> str:
-            return re.sub(r"\s+", " ", str(text)).strip()
 
         def _normalize_toc_title(text: str) -> str:
             return re.sub(r"\s+", "", str(text)).strip().lower()
@@ -366,120 +350,9 @@ class DocIRBuilder:
                 return True
             return False
 
-        def _build_header_footer_index(
-            df: pd.DataFrame,
-        ) -> Tuple[set, set, Dict[int, List[str]], Dict[int, List[str]]]:
-            per_page_items: Dict[int, List[Tuple[Optional[float], str]]] = {}
-            for _, row in df.iterrows():
-                para = row.get("para_text", "")
-                if not isinstance(para, str):
-                    continue
-                text = para.strip()
-                if not text:
-                    continue
-                if len(text) > header_footer_max_len:
-                    continue
-                page_idx = row.get("page_idx", 0)
-                page_num = page_idx + 1
-                bbox = self._parse_bbox(row.get("bbox"))
-                y1 = float(bbox[1]) if bbox else None
-                per_page_items.setdefault(page_num, []).append((y1, text))
-
-            top_by_page: Dict[int, List[str]] = {}
-            bottom_by_page: Dict[int, List[str]] = {}
-            for page_num, items in per_page_items.items():
-                if not items:
-                    continue
-                if all(y is not None for y, _ in items):
-                    items.sort(key=lambda x: x[0])  # top to bottom
-                texts = [t for _, t in items]
-                top_by_page[page_num] = texts[:header_footer_top_bottom_n]
-                bottom_by_page[page_num] = (
-                    texts[-header_footer_top_bottom_n:]
-                    if len(texts) > header_footer_top_bottom_n
-                    else texts
-                )
-
-            header_counts: Dict[str, int] = {}
-            footer_counts: Dict[str, int] = {}
-            for page_num in top_by_page:
-                for text in set(top_by_page.get(page_num, [])):
-                    norm = _normalize_header_footer_text(text)
-                    if not norm:
-                        continue
-                    header_counts[norm] = header_counts.get(norm, 0) + 1
-                for text in set(bottom_by_page.get(page_num, [])):
-                    norm = _normalize_header_footer_text(text)
-                    if not norm:
-                        continue
-                    footer_counts[norm] = footer_counts.get(norm, 0) + 1
-
-            repeated_headers = {
-                t
-                for t, c in header_counts.items()
-                if c >= header_footer_repeat_threshold
-            }
-            repeated_footers = {
-                t
-                for t, c in footer_counts.items()
-                if c >= header_footer_repeat_threshold
-            }
-
-            header_regex_texts = {t for t in header_counts if header_regex.search(t)}
-            footer_regex_texts = {t for t in footer_counts if footer_regex.search(t)}
-
-            header_index = set(repeated_headers)
-            header_index.update(header_regex_texts)
-            footer_index = set(repeated_footers)
-            footer_index.update(footer_regex_texts)
-            # 避免页眉文本被当作页脚：若匹配页眉正则且不匹配页脚正则，则从 footer_index 中移除
-            footer_index = {
-                t
-                for t in footer_index
-                if not (header_regex.search(t) and not footer_regex.search(t))
-            }
-            return header_index, footer_index, top_by_page, bottom_by_page
-
-        def _classify_header_footer_text(
-            text: str,
-            page_num: int,
-            header_index: set,
-            footer_index: set,
-            top_by_page: Dict[int, List[str]],
-            bottom_by_page: Dict[int, List[str]],
-        ) -> Optional[str]:
-            norm = _normalize_header_footer_text(text)
-            if not norm:
-                return None
-            top_set = {
-                _normalize_header_footer_text(t) for t in top_by_page.get(page_num, [])
-            }
-            bottom_set = {
-                _normalize_header_footer_text(t)
-                for t in bottom_by_page.get(page_num, [])
-            }
-
-            # 优先判定页眉：匹配页眉正则且不匹配页脚正则的文本，直接归为 Header
-            if header_regex.search(norm) and not footer_regex.search(norm):
-                return "header"
-            if norm in footer_index and (
-                norm in bottom_set or footer_regex.search(norm)
-            ):
-                return "footer"
-            if norm in header_index and (norm in top_set or header_regex.search(norm)):
-                return "header"
-            if norm in bottom_set and footer_regex.search(norm):
-                return "footer"
-            if norm in top_set and header_regex.search(norm):
-                return "header"
-            return None
-
         # Section 栈: 存储当前打开的 Section 及其层级
         # 格式: [(section_node, section_id, level), ...]
         section_stack: List[Tuple[ET.Element, str, int]] = []
-
-        # 顶层的section计数器
-        top_section_count = 0
 
         section_dict: Dict[str, ET.Element] = {}
         image_path_dict: Dict[str, str] = {}
@@ -495,20 +368,11 @@ class DocIRBuilder:
 
         table_caption_index = _build_table_caption_index(data)
         figure_caption_index = _build_figure_caption_index(data)
-        header_index, footer_index, header_top_by_page, header_bottom_by_page = (
-            _build_header_footer_index(data)
-        )
 
         toc_mode = False
         toc_section_node: Optional[ET.Element] = None
         toc_section_id: Optional[str] = None
         toc_start_page = 0
-
-        def _append_header_footer(text: str, page_num: int, hf_type: str) -> None:
-            target = section_stack[-1][0] if section_stack else root
-            tag = "Header" if hf_type == "header" else "Footer"
-            node = ET.SubElement(target, tag, page_num=str(page_num))
-            node.text = str(text)
 
         print(f"[DocIRBuilder] Processing {len(data)} rows...")
 
@@ -519,6 +383,41 @@ class DocIRBuilder:
 
             # 跳过 Page_Start
             if style == "Page_Start":
+                continue
+
+            # 处理页眉和页脚
+            if style in ["Header", "Footer", "Discarded"]:
+                # 确保有当前 Section
+                if not section_stack:
+                    # 没有 Section，创建一个默认的
+                    section_counter += 1
+                    current_section_id = str(section_counter)
+                    current_section_node = ET.SubElement(
+                        root,
+                        "Section",
+                        section_id=current_section_id,
+                        level="0",
+                        start_page_num=str(current_page),
+                    )
+                    section_stack.append((current_section_node, current_section_id, 0))
+                    section_dict[current_section_id] = current_section_node
+
+                current_section_node = section_stack[-1][0]
+
+                # 创建 Header/Footer 节点
+                if style == "Header":
+                    header_node = ET.SubElement(
+                        current_section_node, "Header", page_num=str(current_page)
+                    )
+                    header_node.text = str(row["para_text"] or "").strip()
+                elif style == "Footer":
+                    footer_node = ET.SubElement(
+                        current_section_node, "Footer", page_num=str(current_page)
+                    )
+                    footer_node.text = str(row["para_text"] or "").strip()
+                # Discarded 类型跳过（既不是明确的页眉，也不是页脚）
+
+                index += 1
                 continue
 
             # 处理 Heading
@@ -563,6 +462,7 @@ class DocIRBuilder:
                         root,
                         "Section",
                         section_id=current_section_id,
+                        level="1",
                         start_page_num=str(current_page),
                     )
                     heading = ET.SubElement(toc_section_node, "Heading")
@@ -595,22 +495,6 @@ class DocIRBuilder:
                     if inferred_heading is not None
                     else self._get_heading_level(heading_text, has_triple_numbering)
                 )
-                # 若已识别为标题层级，则不进行页眉/页脚归类
-                if heading_level is None:
-                    header_footer_type = _classify_header_footer_text(
-                        heading_text,
-                        current_page,
-                        header_index,
-                        footer_index,
-                        header_top_by_page,
-                        header_bottom_by_page,
-                    )
-                    if header_footer_type:
-                        _append_header_footer(
-                            heading_text, current_page, header_footer_type
-                        )
-                        continue
-
                 print(f"[Heading] Level {heading_level}: {heading_text[:50]}...")
 
                 # 生成新的 section_id
@@ -630,11 +514,12 @@ class DocIRBuilder:
                     # 没有父节点，直接添加到 root
                     parent_node = root
 
-                # 3. 创建新的 Section
+                # 3. 创建新的 Section（添加 level 属性）
                 current_section_node = ET.SubElement(
                     parent_node,
                     "Section",
                     section_id=current_section_id,
+                    level=str(heading_level),
                     start_page_num=str(current_page),
                 )
 
@@ -714,6 +599,7 @@ class DocIRBuilder:
                         root,
                         "Section",
                         section_id=current_section_id,
+                        level="1",
                         start_page_num=str(current_page),
                     )
                     section_dict[current_section_id] = current_section_node
@@ -732,17 +618,6 @@ class DocIRBuilder:
                 current_section_node, current_section_id, _ = section_stack[-1]
 
                 content = row["para_text"]
-                header_footer_type = _classify_header_footer_text(
-                    content,
-                    current_page,
-                    header_index,
-                    footer_index,
-                    header_top_by_page,
-                    header_bottom_by_page,
-                )
-                if header_footer_type:
-                    _append_header_footer(content, current_page, header_footer_type)
-                    continue
                 para = ET.SubElement(
                     current_section_node, "Paragraph", page_num=str(current_page)
                 )
@@ -769,14 +644,20 @@ class DocIRBuilder:
 
                 item = row["para_text"]
                 doc_id = os.path.basename(os.path.normpath(data_path))
+                image_bbox = self._parse_bbox(row.get("bbox"))
                 image = ET.SubElement(
                     current_section_node,
                     "Image",
                     image_id=str(image_count),
                     page_num=str(current_page),
                 )
+                if image_bbox:
+                    bbox_str = self._bbox_to_str(image_bbox)
+                    if bbox_str:
+                        image.set("bbox", bbox_str)
                 image_path = None
                 alt_text = None
+                alt_bbox = None
 
                 if isinstance(item, dict):
                     image_path = item.get("path")
@@ -788,6 +669,21 @@ class DocIRBuilder:
                         data_path, doc_id, image_count
                     )
 
+                # 如果没有 alt_text 或需要 bbox，尝试从最近的 figure caption 获取
+                nearest_figure = _find_nearest_figure_caption(
+                    current_page, index, figure_caption_index
+                )
+                if nearest_figure:
+                    nearest_text, nearest_bbox = nearest_figure
+                    if alt_text:
+                        if _normalize_caption_text(
+                            nearest_text
+                        ) == _normalize_caption_text(alt_text):
+                            alt_bbox = nearest_bbox
+                    else:
+                        alt_text = nearest_text
+                        alt_bbox = nearest_bbox
+
                 if image_path:
                     filename = os.path.basename(image_path)
                     image_path_dict[str(image_count)] = filename
@@ -796,8 +692,15 @@ class DocIRBuilder:
                     image_path_dict[str(image_count)] = f"image_{image_count}.png"
 
                 if alt_text:
+                    # 手动添加换行和缩进，使 Alt_Text 换行显示
+                    image.text = "\n          "  # 10 个空格缩进
                     alt_node = ET.SubElement(image, "Alt_Text")
                     alt_node.text = str(alt_text)
+                    if alt_bbox:
+                        bbox_str = self._bbox_to_str(alt_bbox)
+                        if bbox_str:
+                            alt_node.set("bbox", bbox_str)
+                    alt_node.tail = "\n        "  # 8 个空格，回到 Image 标签的缩进级别
 
                 figures.append(
                     FigureNode(
@@ -814,19 +717,6 @@ class DocIRBuilder:
                 if section_stack:
                     current_section_node, current_section_id, _ = section_stack[-1]
                     caption_text = str(row["para_text"])
-                    header_footer_type = _classify_header_footer_text(
-                        caption_text,
-                        current_page,
-                        header_index,
-                        footer_index,
-                        header_top_by_page,
-                        header_bottom_by_page,
-                    )
-                    if header_footer_type:
-                        _append_header_footer(
-                            caption_text, current_page, header_footer_type
-                        )
-                        continue
                     caption = ET.SubElement(current_section_node, "Caption")
                     caption.text = caption_text
 
@@ -847,110 +737,73 @@ class DocIRBuilder:
 
                 current_section_node, current_section_id, _ = section_stack[-1]
                 table_image_path = None
-                figure_image_path = None
-                crop_box = None
-                page_image = None
-                bbox = self._parse_bbox(row.get("bbox"))
-                if bbox and os.path.isdir(page_images_dir):
-                    if page_idx not in page_image_cache:
-                        page_filename = f"page_{page_idx:04d}.png"
-                        page_path = os.path.join(page_images_dir, page_filename)
-                        if os.path.exists(page_path):
-                            page_image_cache[page_idx] = Image.open(page_path)
-                    page_image = page_image_cache.get(page_idx)
-                    if page_image:
-                        max_x, max_y = page_bbox_max.get(
-                            page_idx, (page_image.width, page_image.height)
-                        )
-                        scale_x = page_image.width / max_x if max_x else 1.0
-                        scale_y = page_image.height / max_y if max_y else 1.0
-                        x1, y1, x2, y2 = bbox
-                        pad = max(
-                            pad_px,
-                            int(max(page_image.width, page_image.height) * pad_ratio),
-                        )
-                        left = max(0, int(x1 * scale_x) - pad)
-                        top = max(0, int(y1 * scale_y) - pad)
-                        right = min(page_image.width, int(x2 * scale_x) + pad)
-                        bottom = min(page_image.height, int(y2 * scale_y) + pad)
-                        if right > left and bottom > top:
-                            crop_box = (left, top, right, bottom)
+                table_bbox = self._parse_bbox(row.get("bbox"))
 
                 # Table 的 para_text 可能是字典
                 table_content = row["para_text"]
                 table_alt_text = None
+                table_alt_bbox = None
                 if isinstance(table_content, dict):
                     table_alt_text = table_content.get("alt_text")
+                    raw_image_path = table_content.get("image_path")
+                    if raw_image_path:
+                        table_image_path = raw_image_path
+
+                # Fallback: 如果 MinerU 未提供 caption，尝试查找最近的表题
                 if not table_alt_text:
-                    table_alt_text = _find_nearest_table_caption(
+                    nearest_table = _find_nearest_table_caption(
                         current_page, index, table_caption_index
                     )
-
-                figure_alt_text = _find_nearest_figure_caption(
-                    current_page, index, figure_caption_index
-                )
-
-                # 仅当附近确实有“表”标题时才按表格处理，否则视为图片
-                if not table_alt_text:
-                    if crop_box and page_image:
-                        figures_dir = os.path.join(data_path, "figures")
-                        os.makedirs(figures_dir, exist_ok=True)
-                        figure_filename = (
-                            f"figure_{image_count:04d}_page_{current_page:04d}.png"
-                        )
-                        figure_path = os.path.join(figures_dir, figure_filename)
-                        page_image.crop(crop_box).save(figure_path)
-                        figure_image_path = figure_filename
-                    if figure_image_path:
-                        image_path_dict[str(image_count)] = figure_image_path
-                    image = ET.SubElement(
-                        current_section_node,
-                        "Image",
-                        image_id=str(image_count),
-                        page_num=str(current_page),
+                    if nearest_table:
+                        table_alt_text, table_alt_bbox = nearest_table
+                else:
+                    nearest_table = _find_nearest_table_caption(
+                        current_page, index, table_caption_index
                     )
-                    if figure_image_path:
-                        image.set("image_path", figure_image_path)
-                    if figure_alt_text:
-                        alt_node = ET.SubElement(image, "Alt_Text")
-                        alt_node.text = str(figure_alt_text)
-                    figures.append(
-                        FigureNode(
-                            figure_id=str(image_count),
-                            page_num=current_page,
-                            image_path=image_path_dict.get(str(image_count)),
-                            alt_text=str(figure_alt_text) if figure_alt_text else None,
-                        )
-                    )
-                    image_count += 1
-                    continue
+                    if nearest_table:
+                        nearest_text, nearest_bbox = nearest_table
+                        if _normalize_caption_text(
+                            nearest_text
+                        ) == _normalize_caption_text(table_alt_text):
+                            table_alt_bbox = nearest_bbox
 
-                if crop_box and page_image:
-                    os.makedirs(table_images_dir, exist_ok=True)
-                    table_filename = (
-                        f"table_{table_count:04d}_page_{current_page:04d}.png"
-                    )
-                    table_path = os.path.join(table_images_dir, table_filename)
-                    page_image.crop(crop_box).save(table_path)
-                    table_image_path = table_filename
+                # type=table 就是表格，不再判断"是否有表题"
+                if table_image_path:
                     table_image_path_dict[str(table_count)] = table_image_path
 
                 table_attrs = {
                     "table_id": str(table_count),
                     "page_num": str(current_page),
                 }
+                if table_bbox:
+                    bbox_str = self._bbox_to_str(table_bbox)
+                    if bbox_str:
+                        table_attrs["bbox"] = bbox_str
                 if table_image_path:
                     table_attrs["image_path"] = table_image_path
-                table = ET.SubElement(current_section_node, "CSV_Table", table_attrs)
+                table = ET.SubElement(current_section_node, "Table", table_attrs)
 
+                # 表格内容作为 text
                 if isinstance(table_content, dict):
                     table.text = table_content.get("content", "")
                 else:
                     table.text = str(table_content)
 
+                # Alt_Text 作为子标签（与 Image 对齐）
+                # 手动添加换行和缩进，使 Alt_Text 换行显示
                 if table_alt_text:
+                    # 在 table.text 后添加换行
+                    if table.text:
+                        table.text = table.text + "\n          "  # 10 个空格缩进
+                    else:
+                        table.text = "\n          "
                     alt_node = ET.SubElement(table, "Alt_Text")
                     alt_node.text = str(table_alt_text)
+                    if table_alt_bbox:
+                        bbox_str = self._bbox_to_str(table_alt_bbox)
+                        if bbox_str:
+                            alt_node.set("bbox", bbox_str)
+                    alt_node.tail = "\n        "  # 8 个空格，回到 Table 标签的缩进级别
 
                 tables.append(
                     TableNode(

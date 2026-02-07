@@ -28,7 +28,7 @@ Write-Host ""
 
 # Build command arguments
 $pythonArgs = @(
-    "2_process_extracted_data.py",
+    "step2_process.py",
     "--extract-data-dir", $ExtractDataDir,
     "--save-dir", $SaveDir,
     "--raw-data-dir", $RawDataDir,

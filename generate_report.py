@@ -24,10 +24,25 @@ def generate_html(json_path, output_path):
             .replace("'", "&#39;")
         )
 
-    # 预处理思考过程文本，确保不破坏 HTML 结构
-    norm_thinking = escape_html(data.get('normative_thinking', '无思考过程'))
-    logic_thinking = escape_html(data.get('logic_thinking', '无思考过程'))
-    vision_thinking = escape_html(data.get('vision_thinking', '无思考过程'))
+    # 预处理思考过程文本，确保不破坏 HTML 结构；空时显示占位说明
+    def _thinking_with_fallback(key: str, fallback: str) -> str:
+        raw = data.get(key, "")
+        if not (raw and str(raw).strip()):
+            return escape_html(fallback)
+        return escape_html(str(raw))
+
+    norm_thinking = _thinking_with_fallback(
+        "normative_thinking",
+        "（未记录：规范性审查的思考过程为空，可能因模型未返回 <thinking> 或该次运行未保存。请用 review_runner 重新跑一遍并生成报告。）",
+    )
+    logic_thinking = _thinking_with_fallback(
+        "logic_thinking",
+        "（未记录：逻辑审查的思考过程为空，可能因模型未返回 <thinking> 或该次运行未保存。请用 review_runner 重新跑一遍并生成报告。）",
+    )
+    vision_thinking = _thinking_with_fallback(
+        "vision_thinking",
+        "（未记录：视觉审查的思考过程为空。若使用最新代码，VisionAgent 会汇总决策轨迹；请用 review_runner 重新跑一遍并生成报告。）",
+    )
 
     # 统计
     high_count = len([i for i in issues if i.get("severity") == "High"])
@@ -115,23 +130,25 @@ def generate_html(json_path, output_path):
             .bg-green {{ background: #2ecc71; }}
             .score {{ font-size: 2.5em; font-weight: bold; }}
             .issue-card {{ border: 1px solid #ddd; margin-bottom: 15px; border-radius: 6px; overflow: hidden; }}
-            .issue-header {{ padding: 10px 15px; background: #f8f9fa; display: flex; align-items: center; justify-content: space-between; cursor: pointer; }}
-            .issue-body {{ padding: 15px; display: none; border-top: 1px solid #ddd; }}
+            .issue-header {{ padding: 10px 15px; background: #f8f9fa; cursor: pointer; }}
+            .issue-header-first-row {{ display: flex; align-items: center; justify-content: space-between; }}
+            .issue-header-suggestion {{ margin-top: 6px; padding-left: 1.2em; line-height: 1.5; }}
+            .issue-body {{ padding: 18px; display: none; border-top: 1px solid #ddd; line-height: 1.6; }}
             .badge {{ padding: 4px 8px; border-radius: 4px; font-size: 0.8em; font-weight: bold; color: white; }}
             .badge.High {{ background: #e74c3c; }}
             .badge.Medium {{ background: #f39c12; }}
             .badge.Low {{ background: #3498db; }}
             .quote {{ background: #fff3cd; padding: 10px; border-left: 4px solid #ffc107; margin: 10px 0; font-style: italic; }}
             .suggestion {{ background: #d4edda; padding: 10px; border-left: 4px solid #28a745; margin: 10px 0; }}
-            .thinking-box {{ background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px; margin-top: 20px; }}
-            .thinking-header {{ padding: 10px 15px; background: #e9ecef; cursor: pointer; font-weight: bold; display: flex; justify-content: space-between; align-items: center; }}
-            .thinking-content {{ padding: 15px; display: none; background: #fff; color: #333; font-family: 'Segoe UI', sans-serif; line-height: 1.6; }}
-            .thinking-content h1, .thinking-content h2, .thinking-content h3 {{ margin-top: 1.5em; margin-bottom: 0.8em; color: #2c3e50; border-bottom: 1px solid #eee; padding-bottom: 5px; }}
-            .thinking-content h3 {{ color: #2980b9; border-left: 4px solid #2980b9; padding-left: 10px; background: #f0f7fd; padding: 8px 10px; border-radius: 4px; }}
-            .thinking-content p {{ margin-bottom: 1em; line-height: 1.7; }}
-            .thinking-content ul, .thinking-content ol {{ margin-left: 20px; margin-bottom: 1em; }}
+            .thinking-box {{ background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 4px; margin-top: 24px; margin-bottom: 8px; }}
+            .thinking-header {{ padding: 12px 18px; background: #e9ecef; cursor: pointer; font-weight: bold; display: flex; justify-content: space-between; align-items: center; font-size: 1.05em; }}
+            .thinking-content {{ padding: 20px; display: block; background: #fff; color: #333; font-family: 'Segoe UI', sans-serif; line-height: 1.1; min-height: 220px; max-height: 55vh; overflow-y: auto; white-space: pre-wrap; word-break: break-word; }}
+            .thinking-content h1, .thinking-content h2, .thinking-content h3 {{ margin-top: 0.2em; margin-bottom: 0.1em; color: #2c3e50; border-bottom: 1px solid #eee; padding-bottom: 2px; }}
+            .thinking-content h3 {{ color: #2980b9; border-left: 4px solid #2980b9; padding-left: 8px; background: #f0f7fd; padding: 4px 8px; border-radius: 4px; }}
+            .thinking-content p {{ margin-bottom: 0.05em; line-height: 1.1; }}
+            .thinking-content ul, .thinking-content ol {{ margin-left: 20px; margin-bottom: 0.1em; line-height: 1.1; }}
             .thinking-content code {{ background: #f1f3f5; padding: 2px 4px; border-radius: 3px; font-family: Consolas, monospace; color: #c7254e; }}
-            .thinking-content pre {{ background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto; border: 1px solid #ddd; }}
+            .thinking-content pre {{ background: #f8f9fa; padding: 8px; border-radius: 4px; overflow-x: auto; border: 1px solid #ddd; margin-bottom: 0.2em; }}
             .thinking-content pre code {{ background: none; color: inherit; padding: 0; }}
             .meta {{ font-size: 0.9em; color: #7f8c8d; margin-bottom: 5px; }}
             .empty-msg {{ color: #95a5a6; font-style: italic; padding: 10px; }}
@@ -198,9 +215,9 @@ def generate_html(json_path, output_path):
             <div class="thinking-box">
                 <div class="thinking-header" onclick="toggle('thinking_norm')">
                     <span>🧠 AI 思考过程：规范性审查</span>
-                    <span>▼</span>
+                    <span>▶</span>
                 </div>
-                <div id="thinking_norm" class="thinking-content markdown-content">
+                <div id="thinking_norm" class="thinking-content markdown-content" style="display: none;">
                     {norm_thinking}
                 </div>
             </div>
@@ -208,9 +225,9 @@ def generate_html(json_path, output_path):
             <div class="thinking-box">
                 <div class="thinking-header" onclick="toggle('thinking_logic')">
                     <span>🧠 AI 思考过程：逻辑审查</span>
-                    <span>▼</span>
+                    <span>▶</span>
                 </div>
-                <div id="thinking_logic" class="thinking-content markdown-content">
+                <div id="thinking_logic" class="thinking-content markdown-content" style="display: none;">
                     {logic_thinking}
                 </div>
             </div>
@@ -218,9 +235,9 @@ def generate_html(json_path, output_path):
             <div class="thinking-box" style="margin-bottom: 30px;">
                 <div class="thinking-header" onclick="toggle('thinking_vision')">
                     <span>🧠 AI 思考过程：视觉审查</span>
-                    <span>▼</span>
+                    <span>▶</span>
                 </div>
-                <div id="thinking_vision" class="thinking-content markdown-content">
+                <div id="thinking_vision" class="thinking-content markdown-content" style="display: none;">
                     {vision_thinking}
                 </div>
             </div>
@@ -276,12 +293,10 @@ def generate_html(json_path, output_path):
             modification_reason = modification_advice.get("reason", "")
             modification_suggestion = modification_advice.get("suggestion", "")
 
-            # 标题描述优先使用 AI 修改建议，保证表述对齐
-            title_suggestion = modification_suggestion or issue.get("suggestion", "")
-            suggestion_short = (
-                title_suggestion[:40] + "..."
-                if len(title_suggestion) > 40
-                else title_suggestion
+            # 标题描述显示原文片段，便于快速定位问题
+            title_quote = issue.get("quote", "无引用")
+            quote_short = (
+                title_quote[:160] + "..." if len(title_quote) > 160 else title_quote
             )
 
             modification_target_map = {
@@ -302,45 +317,47 @@ def generate_html(json_path, output_path):
                     .replace("RESULT/COMPARISON", "结果/对比主张")
                 )
 
-            # 构建标题：优先显示图片名称，其次显示caption/图表ID
+            # 构建标题前缀（到「第X页:」为止）与建议内容分开，便于第二行起缩进显示
             if img_id:
                 image_name_short = (
                     image_name[:50] + "..." if len(image_name) > 50 else image_name
                 )
                 if caption:
-                    # 截断过长的caption（保留前50字符）
-                    caption_short = caption[:50] + "..." if len(caption) > 50 else caption
+                    caption_short = (
+                        caption[:50] + "..." if len(caption) > 50 else caption
+                    )
                     if image_name_short:
-                        title_text = (
+                        title_prefix = (
                             f"[图表 {img_id} | {image_name_short}: {caption_short}] "
-                            f"[{issue_type}] 第 {page} 页: {suggestion_short}"
+                            f"[{issue_type}] 第 {page} 页:"
                         )
                     else:
-                        title_text = (
+                        title_prefix = (
                             f"[图表 {img_id}: {caption_short}] "
-                            f"[{issue_type}] 第 {page} 页: {suggestion_short}"
+                            f"[{issue_type}] 第 {page} 页:"
                         )
                 else:
                     if image_name_short:
-                        title_text = (
+                        title_prefix = (
                             f"[图表 {img_id} | {image_name_short}] "
-                            f"[{issue_type}] 第 {page} 页: {suggestion_short}"
+                            f"[{issue_type}] 第 {page} 页:"
                         )
                     else:
-                        title_text = (
-                            f"[图表 {img_id}] [{issue_type}] 第 {page} 页: {suggestion_short}"
-                        )
+                        title_prefix = f"[图表 {img_id}] [{issue_type}] 第 {page} 页:"
             else:
-                title_text = f"[{issue_type}] 第 {page} 页: {suggestion_short}"
+                title_prefix = f"[{issue_type}] 第 {page} 页:"
 
             html += f"""
                 <div class="issue-card">
                     <div class="issue-header" onclick="toggle('issue_{idx}')">
-                        <span>
-                            <span class="badge {severity}">{severity}</span>
-                            <strong>{title_text}</strong>
-                        </span>
-                        <span>▼</span>
+                        <div class="issue-header-first-row">
+                            <span>
+                                <span class="badge {severity}">{severity}</span>
+                                <strong>{title_prefix}</strong>
+                            </span>
+                            <span>▼</span>
+                        </div>
+                        <div class="issue-header-suggestion">{escape_html(quote_short)}</div>
                     </div>
                     <div id="issue_{idx}" class="issue-body">
                         <div class="meta">📍 位置: 第 {page} 页 | 章节: {issue.get('section', '未知')}</div>

@@ -1,5 +1,5 @@
 """
-构建 XML 树（DocIR）预处理第四步
+构建 DocIR 与 XML 树（预处理第三步）
 
 从标准化数据 (data.pkl) 构建文档的层次化 XML 树结构。
 这是预处理流程的最后一步，生成的 XML 树用于 Agent 审查。
@@ -13,6 +13,7 @@ from doc_ir_builder import DocIRBuilder
 
 
 def _build_outline_from_tree(root: ET.Element) -> ET.Element:
+    """从完整 XML 树构建简化的 Outline 视图"""
     outline_root = ET.Element("Outline")
 
     def _copy_section(src_section: ET.Element, dst_parent: ET.Element) -> None:
@@ -23,7 +24,9 @@ def _build_outline_from_tree(root: ET.Element) -> ET.Element:
                 continue
 
             if child.tag == "Heading":
-                heading = ET.SubElement(dst_section, "Heading")
+                heading = ET.SubElement(
+                    dst_section, "Heading", child.attrib
+                )  # ← 保留所有属性（包括level）
                 heading.text = (child.text or "").strip()
                 continue
 
@@ -37,21 +40,21 @@ def _build_outline_from_tree(root: ET.Element) -> ET.Element:
                 image = ET.SubElement(dst_section, "Image", child.attrib)
                 for sub in list(child):
                     if sub.tag == "Alt_Text":
-                        alt = ET.SubElement(image, "Alt_Text")
+                        alt = ET.SubElement(image, "Alt_Text", sub.attrib)
                         alt.text = sub.text
                 continue
 
-            if child.tag == "CSV_Table":
-                table = ET.SubElement(dst_section, "CSV_Table", child.attrib)
+            if child.tag == "Table":
+                table = ET.SubElement(dst_section, "Table", child.attrib)
                 table.text = child.text
                 for sub in list(child):
                     if sub.tag == "Alt_Text":
-                        alt = ET.SubElement(table, "Alt_Text")
+                        alt = ET.SubElement(table, "Alt_Text", sub.attrib)
                         alt.text = sub.text
                 continue
 
             if child.tag == "Caption":
-                caption = ET.SubElement(dst_section, "Caption")
+                caption = ET.SubElement(dst_section, "Caption", child.attrib)
                 caption.text = (child.text or "").strip()
                 continue
 
@@ -72,9 +75,7 @@ def _build_outline_from_tree(root: ET.Element) -> ET.Element:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="构建 XML 树（DocIR）- 预处理第四步"
-    )
+    parser = argparse.ArgumentParser(description="构建 DocIR 与 XML 树 - 预处理第三步")
     parser.add_argument(
         "--data-path",
         type=str,
@@ -137,7 +138,7 @@ def main():
     # 处理每个文档
     for doc_id, data_path in docs_to_process:
         print(f"\n{'='*60}")
-        print(f"正在构建 XML 树: {doc_id}")
+        print(f"正在构建 DocIR 与 XML 树: {doc_id}")
         print(f"{'='*60}")
 
         # 验证必要文件
@@ -148,24 +149,14 @@ def main():
 
         page_images_dir = os.path.join(data_path, "page_images")
         if not os.path.exists(page_images_dir):
-            print(
-                f"[Warning] {doc_id}: 缺少 page_images 目录，XML 树可能不完整"
-            )
+            print(f"[Warning] {doc_id}: 缺少 page_images 目录，XML 树可能不完整")
 
         try:
-            # 构建 XML 树
+            # 构建 DocIR 与 XML 树
             result = builder.build_from_pkl(data_path)
 
-            # 保存 XML 树为文件
-            xml_output_path = os.path.join(args.output_dir, f"tree_{doc_id}.xml")
+            # 保存 Outline 视图（用于审查）
             outline_output_path = os.path.join(args.output_dir, f"outline_{doc_id}.xml")
-
-            # 保存完整树
-            tree = ET.ElementTree(result.root)
-            tree.write(xml_output_path, encoding="utf-8", xml_declaration=True)
-            print(f"[OK] 完整 XML 树已保存 -> {xml_output_path}")
-
-            # 保存大纲视图（树状简化版）
             outline_root = _build_outline_from_tree(result.root)
             ET.indent(outline_root, space="  ")
             outline_tree = ET.ElementTree(outline_root)

@@ -1,27 +1,30 @@
 """
 简化的审查运行脚本
 """
+
 import os
 import sys
 from dotenv import load_dotenv
 
 # 设置 UTF-8 编码
-if sys.platform == 'win32':
+if sys.platform == "win32":
     import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-load_dotenv(override=True, encoding='utf-8')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
+load_dotenv(override=True, encoding="utf-8")
 
 # 添加路径
 sys.path.insert(0, os.getcwd())
 
 from agent import doc_agent
+from agent import doc_reader
 from agent.logic_agent import LogicAgent
 from agent.normative_agent import NormativeAgent
 from agent.vision_agent import VisionAgent
-from preprocess.doc_reader import DocReader
 import pandas as pd
+
 
 def main():
     print("=" * 80)
@@ -34,18 +37,23 @@ def main():
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # 检查数据文件
-    data_pkl = os.path.join(data_path, "data.pkl")
-    if not os.path.exists(data_pkl):
-        print(f"[ERROR] Data file not found: {data_pkl}")
+    # 使用预处理生成的 outline XML（避免重复构建）
+    outline_path = os.path.join(save_dir, f"outline_{doc_id}.xml")
+    if not os.path.exists(outline_path):
+        print(f"[ERROR] Outline XML not found: {outline_path}")
+        print(
+            f"[HINT] Please run preprocessing first: ./scripts/run_pipeline.ps1 -DocName {doc_id}"
+        )
         return
 
     print(f"\n[1/5] Loading document: {doc_id}")
-    reader = DocReader(data_path=data_path)
+    reader = doc_reader.OutlineOnlyReader(
+        outline_path=outline_path,
+        data_path=data_path,
+    )
     print(f"  - Total pages: {reader.num_page}")
-    print(f"  - Images: {reader.image_count}")
-    print(f"  - Tables: {reader.table_count}")
-    print(f"  - Paragraphs: {reader.para_count}")
+    print(f"  - Images: {len(reader.image_path_dict)}")
+    print(f"  - Tables: {len(reader.table_image_path_dict)}")
 
     # 初始化 Agent
     api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -99,25 +107,25 @@ def main():
         ).strip()
 
         # 移除 markdown 代码块标记
-        cleaned = re.sub(
-            r"^```(?:json)?|```$", "", cleaned, flags=re.MULTILINE
-        ).strip()
+        cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned, flags=re.MULTILINE).strip()
 
         if not cleaned:
             return {"issues": []}
 
         # 尝试修复截断的JSON
-        if cleaned and cleaned[-1] not in '}]]':
+        if cleaned and cleaned[-1] not in "}]]":
             print(f"[Warning] JSON appears to be truncated, attempting to fix...")
             if cleaned.count('"') % 2 != 0:
                 cleaned += '"'
-            open_braces = cleaned.count('{') - cleaned.count('}')
-            open_brackets = cleaned.count('[') - cleaned.count(']')
+            open_braces = cleaned.count("{") - cleaned.count("}")
+            open_brackets = cleaned.count("[") - cleaned.count("]")
             for _ in range(open_brackets):
-                cleaned += ']'
+                cleaned += "]"
             for _ in range(open_braces):
-                cleaned += '}'
-            print(f"[Fix] Attempted to close {open_brackets} brackets and {open_braces} braces")
+                cleaned += "}"
+            print(
+                f"[Fix] Attempted to close {open_brackets} brackets and {open_braces} braces"
+            )
 
         try:
             return json.loads(cleaned)
@@ -138,19 +146,19 @@ def main():
                     if escape_next:
                         escape_next = False
                         continue
-                    if char == '\\':
+                    if char == "\\":
                         escape_next = True
                         continue
                     if char == '"' and not escape_next:
                         in_string = not in_string
                         continue
                     if not in_string:
-                        if char == '{':
+                        if char == "{":
                             brace_count += 1
-                        elif char == '}':
+                        elif char == "}":
                             brace_count -= 1
                             if brace_count == 0:
-                                json_str = cleaned[start:i+1]
+                                json_str = cleaned[start : i + 1]
                                 return json.loads(json_str)
             except:
                 pass
@@ -165,7 +173,7 @@ def main():
         "normative_thinking": norm_res.get("thinking", ""),
         "logic_thinking": logic_res.get("thinking", ""),
         "vision_thinking": "",
-        "issues": []
+        "issues": [],
     }
 
     # 收集所有问题
@@ -184,6 +192,7 @@ def main():
 
     # 保存结果
     import json
+
     result_file = os.path.join(save_dir, f"review_{doc_id}.json")
     with open(result_file, "w", encoding="utf-8") as f:
         json.dump(final_result, f, ensure_ascii=False, indent=2)
@@ -196,9 +205,11 @@ def main():
     print("=" * 80)
 
     # 统计
-    high_count = len([i for i in final_result['issues'] if i.get('severity') == 'High'])
-    medium_count = len([i for i in final_result['issues'] if i.get('severity') == 'Medium'])
-    low_count = len([i for i in final_result['issues'] if i.get('severity') == 'Low'])
+    high_count = len([i for i in final_result["issues"] if i.get("severity") == "High"])
+    medium_count = len(
+        [i for i in final_result["issues"] if i.get("severity") == "Medium"]
+    )
+    low_count = len([i for i in final_result["issues"] if i.get("severity") == "Low"])
 
     print(f"\nSeverity Distribution:")
     print(f"  High:   {high_count}")
@@ -209,9 +220,11 @@ def main():
     # 生成 HTML 报告
     print(f"\nGenerating HTML report...")
     from generate_report import generate_html
+
     html_file = os.path.join(save_dir, f"report_{doc_id}.html")
     generate_html(result_file, html_file)
     print(f"  - HTML report: {html_file}")
+
 
 if __name__ == "__main__":
     main()

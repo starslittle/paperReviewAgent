@@ -88,7 +88,7 @@ RESULT_DIR = args.result_dir
 # This sample illustrates how to extract Text, Table Elements Information from PDF along with renditions of Figure,
 # Table elements.
 #
-# Refer to README.md for instructions on how to run the samples & understand output zip file.
+# Refer to md/README.md for instructions on how to run the samples & understand output zip file.
 #
 class ExtractTextTableInfoWithFiguresTablesRenditionsFromPDF:
     def __init__(self, file_path, sid):

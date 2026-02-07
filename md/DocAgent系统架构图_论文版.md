@@ -1,4 +1,5 @@
 # DocAgent: 基于多智能体的长文档多模态理解系统
+
 ## 详细架构设计文档（论文版）
 
 ---
@@ -21,6 +22,7 @@
 ### 1.1 研究背景与动机
 
 DocAgent 是一个面向**超长文档多模态理解**的多智能体协作框架，模拟人类阅读学术论文的过程：
+
 - **挑战1**: 现有 LLM 上下文窗口有限（4K-32K tokens），无法处理百页以上的文档
 - **挑战2**: 文档包含文本、图表、公式等多模态信息，需要综合理解
 - **挑战3**: 简单的 Map-Reduce 分块方法会丢失全局逻辑连贯性
@@ -51,12 +53,12 @@ DocAgent 是一个面向**超长文档多模态理解**的多智能体协作框�
 
 ### 1.3 系统特点
 
-| 特性 | 传统方法 | DocAgent |
-|------|---------|----------|
-| **文档长度支持** | ≤ 10K tokens | **100+ 页**（短上下文迭代） |
-| **多模态理解** | 仅文本 or 简单 OCR | **视觉模型验证图表** |
-| **全局一致性** | 分块丢失上下文 | **Map-Reduce + 记忆银行** |
-| **误差修正** | 依赖原始提取 | **OCR 增强 + 视觉交叉验证** |
+| 特性             | 传统方法           | DocAgent                    |
+| ---------------- | ------------------ | --------------------------- |
+| **文档长度支持** | ≤ 10K tokens       | **100+ 页**（短上下文迭代） |
+| **多模态理解**   | 仅文本 or 简单 OCR | **视觉模型验证图表**        |
+| **全局一致性**   | 分块丢失上下文     | **Map-Reduce + 记忆银行**   |
+| **误差修正**     | 依赖原始提取       | **OCR 增强 + 视觉交叉验证** |
 
 ---
 
@@ -139,15 +141,15 @@ DocAgent 是一个面向**超长文档多模态理解**的多智能体协作框�
 
 ### 2.2 模块职责划分
 
-| 模块 | 核心功能 | 输入 | 输出 |
-|------|---------|------|------|
-| **预处理模块** | PDF→结构化XML | 原始PDF | data.pkl + 图像 |
-| **DocReader** | 动态文档检索 | XML树 | 章节内容/图片 |
-| **Agent-Normative** | 格式规范审查 | Outline + 正文片段 | 规范性问题列表 |
-| **Agent-Logic** | 逻辑一致性审查 | 分章节内容 | 逻辑问题列表 |
-| **Agent-Vision** | 图文一致性审查 | 图片 + Caption | 视觉问题列表 |
-| **记忆银行** | 跨章节事实存储 | 章节摘要 + 实体 | 冲突检测结果 |
-| **报告生成** | 结果可视化 | 审查JSON | HTML报告 |
+| 模块                | 核心功能       | 输入               | 输出            |
+| ------------------- | -------------- | ------------------ | --------------- |
+| **预处理模块**      | PDF→结构化XML  | 原始PDF            | data.pkl + 图像 |
+| **DocReader**       | 动态文档检索   | XML树              | 章节内容/图片   |
+| **Agent-Normative** | 格式规范审查   | Outline + 正文片段 | 规范性问题列表  |
+| **Agent-Logic**     | 逻辑一致性审查 | 分章节内容         | 逻辑问题列表    |
+| **Agent-Vision**    | 图文一致性审查 | 图片 + Caption     | 视觉问题列表    |
+| **记忆银行**        | 跨章节事实存储 | 章节摘要 + 实体    | 冲突检测结果    |
+| **报告生成**        | 结果可视化     | 审查JSON           | HTML报告        |
 
 ---
 
@@ -163,7 +165,7 @@ DocAgent 是一个面向**超长文档多模态理解**的多智能体协作框�
                             │
         ┌───────────────────▼────────────────────┐
         │  Step 1: Adobe PDF Services 提取        │
-        │  (1_run_pdf_extract.py)                │
+        │  (1_run_file_extract.py)                │
         ├────────────────────────────────────────┤
         │  • 识别文档结构（标题层级、段落、表格） │
         │  • 提取图片和表格渲染                   │
@@ -236,6 +238,7 @@ df = pd.DataFrame({
 ```
 
 **示例数据**:
+
 ```
    style          table_id   para_text
 0  Page_Start     1          None
@@ -279,6 +282,7 @@ DocReader 将 DataFrame 转换为层次化 XML 树：
 ```
 
 **设计优势**:
+
 - **层次清晰**: Section 嵌套反映文档结构（支持最多10层）
 - **页码标注**: 每个元素都记录 `page_num`，便于定位
 - **灵活查询**: 支持 XPath 式的精确检索
@@ -364,7 +368,8 @@ DocReader 将 DataFrame 转换为层次化 XML 树：
 **问题背景**: Adobe PDF 提取器可能漏识别章节标题（如加粗但无明确 Heading 标记）。
 
 **解决方案**:
-1. **触发条件**: 
+
+1. **触发条件**:
    - issue_type = "规范性"
    - suggestion 包含关键词: "缺少", "丢失", "不连续", "页码"
 2. **验证流程**:
@@ -372,7 +377,7 @@ DocReader 将 DataFrame 转换为层次化 XML 树：
    def verify_with_vision(issue):
        page_num = issue['page']
        page_image = doc_reader.get_page_image(page_num)
-       
+
        prompt = """
        问题: {issue['suggestion']}
        请查看页面截图，判断该问题是否为"误报"：
@@ -380,7 +385,7 @@ DocReader 将 DataFrame 转换为层次化 XML 树：
        - 若页面确实缺失 → is_false_positive = False
        输出: {"is_false_positive": bool, "reason": str}
        """
-       
+
        response = vision_model.chat(prompt, page_image)
        if response['is_false_positive']:
            return None  # 移除误报
@@ -503,6 +508,7 @@ DocReader 将 DataFrame 转换为层次化 XML 树：
 #### 4.3.2 记忆银行机制（创新点）
 
 **1. Logic Memory (逻辑记忆)**
+
 ```python
 logic_memory = [
     {
@@ -524,10 +530,12 @@ logic_memory = [
 ```
 
 **全局审查发现的矛盾**:
+
 - 第1章声称 45.3% → 第4章实测 43.8% → 第5章又说 44.5%
 - **判定**: 三处数值不一致，需统一修改
 
 **2. Fact Store (事实存储)**
+
 ```python
 fact_store = {
     'entities': {
@@ -556,6 +564,7 @@ fact_store = {
 ```
 
 **冲突检测示例**:
+
 ```python
 conflicts = []
 for key, values in fact_store['numbers'].items():
@@ -650,6 +659,7 @@ for key, values in fact_store['numbers'].items():
 **问题背景**: 图片的 Caption 可能跨页（图在第N页末尾，Caption在第N+1页开头），导致视觉模型看不到完整上下文。
 
 **解决方案**:
+
 ```python
 pages_to_fetch = [current_page - 1, current_page, current_page + 1]
 page_labels = ["前一页", "当前页", "后一页"]
@@ -670,6 +680,7 @@ messages = [
 ```
 
 **Prompt 设计（引导式三步推理）**:
+
 ```
 步骤1：视觉定位
 - 观察【目标图片】的形状、内容、颜色
@@ -686,6 +697,7 @@ messages = [
 ```
 
 **实际案例**:
+
 ```
 目标图片: 图2-5 Focus结构 (image_id=7, page=23)
 
@@ -713,6 +725,7 @@ messages = [
 Reviewer 用于 QA 任务的交叉验证（本项目未启用，但保留接口）。
 
 **功能**:
+
 - 对 Actor Agent 的答案进行二次验证
 - 调用工具检索补充证据
 - 输出最终答案
@@ -763,38 +776,38 @@ def build_xml_tree(df):
     root = ET.Element("Document")
     stack = [(root, 0)]  # (当前节点, Heading级别)
     section_id_stack = []
-    
+
     for index, row in df.iterrows():
         if row['style'].startswith('Heading'):
             heading_num = int(row['style'].split()[1])  # Heading 1 → 1
-            
+
             # 处理层级关系
             while heading_num <= stack[-1][1]:  # 回退到更高层级
                 stack.pop()
                 section_id_stack.pop()
-            
+
             # 创建新 Section
             if heading_num == stack[-1][1]:  # 同级
                 section_id_stack[-1] += 1  # 1.1 → 1.2
             else:  # 更低级
                 section_id_stack.append(1)  # 1 → 1.1
-            
+
             section_id = '.'.join(map(str, section_id_stack))
-            curr_node = ET.SubElement(stack[-1][0], "Section", 
+            curr_node = ET.SubElement(stack[-1][0], "Section",
                                      section_id=section_id,
                                      start_page_num=curr_page)
-            
+
             heading = ET.SubElement(curr_node, "Heading")
             heading.text = row['para_text']
-            
+
             stack.append((curr_node, heading_num))
-        
+
         elif row['style'] == 'Normal':
             para = ET.SubElement(stack[-1][0], "Paragraph", page_num=curr_page)
             para.text = row['para_text']
-        
+
         # ... (处理 Image, Table, Caption 等)
-    
+
     return root
 ```
 
@@ -850,13 +863,16 @@ sample_results/
       "suggestion": "图中显示的是 CBS 模块，但 Caption 写的是 Focus 结构，请核对"
     }
   ],
-  "issues": [/* 合并所有问题 */]
+  "issues": [
+    /* 合并所有问题 */
+  ]
 }
 ```
 
 ### 6.3 HTML 报告设计
 
 **特点**:
+
 - 响应式设计（Bootstrap 风格）
 - 可折叠的问题卡片
 - 分类统计仪表盘
@@ -864,6 +880,7 @@ sample_results/
 - 按严重程度颜色编码（High=红色, Medium=橙色, Low=蓝色）
 
 **示例截图**:
+
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  🎓 论文审查报告: bylw-cmy                              │
@@ -895,39 +912,43 @@ sample_results/
 
 ### 7.1 核心技术栈
 
-| 技术 | 用途 | 版本/模型 |
-|------|------|----------|
-| **Adobe PDF Services** | 结构化 PDF 提取 | SDK 4.0+ |
-| **PaddleOCR** | OCR 增强标题检测 | PaddlePaddle 3.0 |
-| **PyMuPDF (fitz)** | PDF 页面渲染 | ≥ 1.23 |
-| **DeepSeek-V3** | 文本审查 LLM | deepseek-chat |
-| **Qwen3-VL-Flash** | 视觉理解模型 | 多模态 LLM |
-| **XML + XPath** | 文档结构表示 | ElementTree |
-| **Pandas** | 数据处理 | ≥ 1.5 |
+| 技术                   | 用途             | 版本/模型        |
+| ---------------------- | ---------------- | ---------------- |
+| **Adobe PDF Services** | 结构化 PDF 提取  | SDK 4.0+         |
+| **PaddleOCR**          | OCR 增强标题检测 | PaddlePaddle 3.0 |
+| **PyMuPDF (fitz)**     | PDF 页面渲染     | ≥ 1.23           |
+| **DeepSeek-V3**        | 文本审查 LLM     | deepseek-chat    |
+| **Qwen3-VL-Flash**     | 视觉理解模型     | 多模态 LLM       |
+| **XML + XPath**        | 文档结构表示     | ElementTree      |
+| **Pandas**             | 数据处理         | ≥ 1.5            |
 
 ### 7.2 创新点总结
 
 #### 1. **OCR 增强的标题修正**
+
 - **问题**: Adobe 提取器对非标准格式的标题（加粗但无明确标记）识别率低
-- **方案**: 
+- **方案**:
   1. PaddleOCR 识别所有文本行 + 字体大小/粗体启发式规则
   2. 对比 OCR 与 Adobe 结果，交叉验证
   3. 自动修正: 补充遗漏标题 / 降级误识别标题
 
 #### 2. **视觉验证的误报过滤**
+
 - **问题**: 文本分析发现"缺少章节4.2"，但可能是 PDF 解析器错误
-- **方案**: 
+- **方案**:
   1. 触发条件: 涉及"缺失"/"编号"的规范性问题
   2. 调用 Qwen-VL 查看页面截图
   3. 判断: 若页面确实有 → 移除误报; 若确实缺失 → 保留问题
 
 #### 3. **三页窗口的多模态输入**
+
 - **问题**: 图片 Caption 可能跨页，视觉模型看不到完整上下文
-- **方案**: 
+- **方案**:
   - 输入: 目标图片 + 前一页截图 + 当前页截图 + 后一页截图
   - Prompt 引导: 三步推理（定位 → 解析 → 判断）
 
 #### 4. **层次化 Map-Reduce 逻辑审查**
+
 - **问题**: 直接输入整个文档超出上下文窗口，分块又丢失全局逻辑
 - **方案**:
   1. **Map 阶段**: 分章节审查 → 提取摘要（浓缩信息）
@@ -935,6 +956,7 @@ sample_results/
   3. 摘要长度: ~200字/章节 → 8章节只需1600字符
 
 #### 5. **细粒度事实存储与冲突检测**
+
 - **问题**: Map-Reduce 只能检测宏观矛盾，微观数值冲突难以发现
 - **方案**:
   - 提取: 实体（人名/机构）、数值（准确率/样本数）、时间、论断
@@ -942,6 +964,7 @@ sample_results/
   - 检测: 同一 key 的不同 value → 冲突报警
 
 #### 6. **工具化的动态检索接口**
+
 - **问题**: LLM 无法预知需要哪些内容，一次性输入大纲+正文 → 浪费 tokens
 - **方案**:
   - 提供工具: `search()`, `get_section_content()`, `get_image()`
@@ -960,7 +983,7 @@ sample_results/
 │ (bylw.pdf)   │
 └──────┬───────┘
        │
-       │ 1_run_pdf_extract.py
+       │ 1_run_file_extract.py
        ▼
 ┌──────────────────────────────┐
 │  Adobe 提取结果               │
@@ -1057,7 +1080,7 @@ sample_results/
 cd preprocess
 
 # Step 1: Adobe PDF 提取
-python 1_run_pdf_extract.py \
+python 1_run_file_extract.py \
     --raw-data-dir ../data/ \
     --result-dir ./extract_output/
 
@@ -1098,17 +1121,18 @@ python generate_report.py \
 
 **处理一篇50页本科论文的典型数据**:
 
-| 阶段 | 耗时 | API 调用次数 | Tokens 消耗 |
-|------|------|-------------|-------------|
-| **预处理** | ~2分钟 | 1 (Adobe) | 免费额度 |
-| **OCR 增强** | ~30秒 | 0 (本地) | 0 |
-| **规范性审查** | ~10秒 | 1 | ~8K tokens |
-| **逻辑审查 (Map)** | ~80秒 | 8 | ~96K tokens (12K/章节) |
-| **逻辑审查 (Reduce)** | ~15秒 | 1 | ~6K tokens |
-| **视觉审查** | ~120秒 | 20 | ~40K tokens (2K/图) |
-| **总计** | ~5分钟 | 31 | ~150K tokens |
+| 阶段                  | 耗时   | API 调用次数 | Tokens 消耗            |
+| --------------------- | ------ | ------------ | ---------------------- |
+| **预处理**            | ~2分钟 | 1 (Adobe)    | 免费额度               |
+| **OCR 增强**          | ~30秒  | 0 (本地)     | 0                      |
+| **规范性审查**        | ~10秒  | 1            | ~8K tokens             |
+| **逻辑审查 (Map)**    | ~80秒  | 8            | ~96K tokens (12K/章节) |
+| **逻辑审查 (Reduce)** | ~15秒  | 1            | ~6K tokens             |
+| **视觉审查**          | ~120秒 | 20           | ~40K tokens (2K/图)    |
+| **总计**              | ~5分钟 | 31           | ~150K tokens           |
 
 **成本估算**:
+
 - DeepSeek-V3: $1/M tokens → **$0.15**
 - Qwen3-VL-Flash: $0.5/M tokens → **$0.02**
 - **总成本: < $0.2**（约人民币1.5元）
@@ -1135,6 +1159,7 @@ python generate_report.py \
 ❌ **实时性**: 串行处理，无法实时审查（可优化为流式）
 
 **未来改进方向**:
+
 1. 集成 MathPix/LaTeX OCR 处理公式
 2. 支持多轮对话式审查（用户交互修正）
 3. 引入专家评分数据集，微调审查模型
@@ -1157,13 +1182,15 @@ DocAgent 是一个**面向长文档多模态理解的多智能体协作框架**�
 ---
 
 **相关论文**:
-> Sun, Li, et al. "DocAgent: An Agentic Framework for Multi-Modal Long-Context Document Understanding." *EMNLP 2025*. [[PDF](https://aclanthology.org/2025.emnlp-main.893.pdf)]
+
+> Sun, Li, et al. "DocAgent: An Agentic Framework for Multi-Modal Long-Context Document Understanding." _EMNLP 2025_. [[PDF](https://aclanthology.org/2025.emnlp-main.893.pdf)]
 
 **项目结构**:
+
 ```
 DocAgent-main/
 ├── preprocess/              # 数据预处理
-│   ├── 1_run_pdf_extract.py
+│   ├── 1_run_file_extract.py
 │   ├── 2_process_extracted_data.py
 │   ├── 3_make_page_images.py
 │   └── ocr_heading_detector.py

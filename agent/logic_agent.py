@@ -10,11 +10,36 @@ from .prompts import (
     local_chapter_review_prompt,
     local_chapter_review_retry_prompt,
     logic_prompt,
-    normative_logic_prompt,
 )
 
 
 class LogicAgent:
+    """
+    逻辑性审查 Agent (Logic Review)
+
+    【职责范围】：
+    - ✅ 论证逻辑：论证跳跃、前后矛盾、论据不足
+    - ✅ 语言学术性：口语化表达（"我觉得"、"超级"、"很"等）、用词不规范
+    - ✅ 内容一致性：摘要vs结论、方法vs实验、标题vs内容
+    - ✅ 连贯性：段落衔接、章节过渡
+    - ✅ 内容充分性：工作量、创新点、实验数据
+
+    【不负责】：
+    - ❌ 格式编号：章节编号、图表编号（由 NormativeAgent 负责）
+    - ❌ 引用格式：参考文献格式（由 NormativeAgent 负责）
+    - ❌ 页面格式：页码、页眉页脚（由 NormativeAgent 负责）
+
+    【审查方式】：
+    - Map-Reduce：分章节局部审查 + 全局一致性检查
+    - 覆盖范围：全文（每章 12000 字）
+    - 审查起点：从「摘要」开始（与 NormativeAgent、VisionAgent 对齐）
+
+    【输出】：
+    - issue_type: "逻辑性" | "语言" | "连贯性"
+    - 细粒度事实抽取（实体/数值/时间/论断）→ fact_store
+    - 跨章节冲突检测（数值差异 > 5%）
+    """
+
     ROLE_WEIGHTS = {
         "RESULT": 1.0,
         "METHOD": 0.9,
@@ -33,9 +58,18 @@ class LogicAgent:
         raw = res.get("raw", "")
         thinking = res.get("thinking", "")
         parsed = self.doc_agent._parse_json(raw) if raw else {"issues": []}
-        issues = parsed.get("issues", [])
-        if not isinstance(issues, list):
-            parsed["issues"] = []
+
+        # 处理两种可能的返回格式：{"issues": [...]} 或 [{...}, {...}]
+        if isinstance(parsed, list):
+            issues = parsed
+            parsed = {"issues": issues}
+        elif isinstance(parsed, dict):
+            issues = parsed.get("issues", [])
+            if not isinstance(issues, list):
+                parsed["issues"] = []
+        else:
+            parsed = {"issues": []}
+
         return {
             "raw": raw,
             "parsed": parsed,
@@ -68,6 +102,7 @@ class LogicAgent:
 2. **数值（Numbers）**：性能指标、实验数据、统计数字等
    - 示例：{"type": "性能指标", "key": "准确率", "value": 95.5, "unit": "%"}
    - 示例：{"type": "实验数据", "key": "样本数量", "value": 1000, "unit": "个"}
+   - **重要**：不要提取参考文献中的期刊卷期号、期次、页码等引用信息（如"第52卷"、"第3期"、"pp.123-456"等）
 
 3. **时间（Dates）**：日期、时间节点、时间段等
    - 示例：{"type": "时间节点", "key": "项目启动", "value": "2023年3月"}
@@ -79,6 +114,7 @@ class LogicAgent:
 - 只提取明确的事实，不要推断
 - 保留原文上下文片段（用于定位）
 - 如果某类事实不存在，返回空数组
+- **重要**：跳过参考文献区域的卷期号、期次等引用格式信息
 
 输出JSON格式：
 {
@@ -113,6 +149,10 @@ class LogicAgent:
             )
             raw_response = response.choices[0].message.content
             facts = self.doc_agent._parse_json(raw_response)
+
+            # 确保返回字典格式
+            if not isinstance(facts, dict):
+                facts = {"entities": [], "numbers": [], "dates": [], "claims": []}
 
             print(
                 f"[Fact Extraction] Extracted: {len(facts.get('entities', []))} entities, "
@@ -231,7 +271,10 @@ class LogicAgent:
                 )
                 raw = response.choices[0].message.content
                 data = self.doc_agent._parse_json(raw)
-                if isinstance(data, dict) and "is_conflict" in data:
+                # 确保返回字典格式
+                if not isinstance(data, dict):
+                    return True, ""
+                if "is_conflict" in data:
                     return bool(data.get("is_conflict")), data.get("reason", "")
             except Exception as e:
                 error_text = str(e)
@@ -246,7 +289,25 @@ class LogicAgent:
         # 1. 检测实体冲突（如"甲方"在不同章节有不同的值）- 已关闭
 
         # 2. 检测数值冲突（如"准确率"在不同章节有明显差异）
+        # 排除参考文献引用信息（期刊卷期、期次、页码等）
+        reference_keywords = ["卷", "期", "页", "volume", "issue", "pp", "p.", "页码"]
+
         for metric_key, occurrences in self.fact_store["numbers"].items():
+            # 检查是否为参考文献引用信息
+            is_reference_info = any(
+                keyword in metric_key.lower()
+                or keyword in occ.get("context", "").lower()
+                for keyword in reference_keywords
+                for occ in occurrences
+            )
+
+            # 如果是参考文献引用信息，跳过检测
+            if is_reference_info:
+                print(
+                    f"[Fact Conflict Detection] Skipping reference info: '{metric_key}'"
+                )
+                continue
+
             if len(occurrences) > 1:
                 values = [
                     occ["value"]
@@ -310,7 +371,11 @@ class LogicAgent:
             return False
         chapter_role = logic_skeleton.get("chapter_role")
         core_claims = logic_skeleton.get("core_claims")
-        if not chapter_role or not isinstance(core_claims, list) or len(core_claims) < 1:
+        if (
+            not chapter_role
+            or not isinstance(core_claims, list)
+            or len(core_claims) < 1
+        ):
             return False
         if isinstance(stability_check, dict):
             if stability_check.get("is_stable") is False:
@@ -348,28 +413,82 @@ class LogicAgent:
         return global_context
 
     def _get_outermost_section_ids(self) -> List[str]:
+        """
+        获取真实章节的顶层Section ID（结合 level 属性和 Heading 标签）
+        - 只选择 level="1" 的顶层Section
+        - 必须包含真实 <Heading> 标签
+        - 从「摘要」开始
+        - 排除目录、封面、承诺等非内容Section
+        """
         section_ids = []
         abstract_start_index = None
+
+        # 第一遍：找到摘要的位置
         for idx, child in enumerate(self.doc_agent.doc_reader.root):
-            if child.tag != "Section" or not child.get("section_id"):
+            if child.tag != "Section":
                 continue
+
+            # 检查是否包含真实标题
             title_text = None
             for node in child:
                 if node.tag in ["Heading", "Title"] and node.text:
                     title_text = node.text.strip()
                     break
+
             if title_text:
                 normalized = title_text.lower().replace(" ", "")
-                if any(
-                    key in normalized for key in ["摘要", "abstract", "摘要", "摘 要"]
-                ):
+                if any(key in normalized for key in ["摘要", "abstract"]):
                     abstract_start_index = idx
                     break
+
+        # 黑名单：排除这些Section（即使有Heading和level=1）
+        SKIP_TITLES = [
+            "目录",
+            "目 录",
+            "封面",
+            "诚信承诺",
+            "致谢",
+            "contents",
+            "tableofcontents",
+        ]
+
+        # 第二遍：收集真实的Level 1章节
         for idx, child in enumerate(self.doc_agent.doc_reader.root):
-            if child.tag == "Section" and child.get("section_id"):
-                if abstract_start_index is not None and idx < abstract_start_index:
+            if child.tag != "Section" or not child.get("section_id"):
+                continue
+
+            # 跳过摘要之前的Section
+            if abstract_start_index is not None and idx < abstract_start_index:
+                continue
+
+            # 检查 level 属性
+            level = child.get("level")
+            if level != "1":
+                continue
+
+            # 检查是否包含真实标题
+            has_heading = False
+            title_text = None
+            for node in child:
+                if node.tag in ["Heading", "Title"] and node.text:
+                    title_text = node.text.strip()
+                    has_heading = True
+                    break
+
+            # 必须有Heading才算章节
+            if not has_heading:
+                continue
+
+            # 排除黑名单中的Section
+            if title_text:
+                normalized_title = title_text.lower().replace(" ", "")
+                if any(skip in normalized_title for skip in SKIP_TITLES):
+                    print(f"[Logic] Skip non-content section: {title_text}")
                     continue
-                section_ids.append(child.get("section_id"))
+
+            # 通过所有检查，加入章节列表
+            section_ids.append(child.get("section_id"))
+
         return section_ids
 
     def run_hierarchical_logic_review(self) -> Dict[str, Any]:
@@ -436,6 +555,7 @@ class LogicAgent:
             )
 
             try:
+
                 def _run_local_review(system_prompt):
                     messages = [
                         {"role": "system", "content": system_prompt},
@@ -449,14 +569,10 @@ class LogicAgent:
                     thinking_match = re.search(
                         r"<thinking>(.*?)</thinking>", raw, re.DOTALL
                     )
-                    thinking = (
-                        thinking_match.group(1).strip() if thinking_match else ""
-                    )
+                    thinking = thinking_match.group(1).strip() if thinking_match else ""
                     return raw, data, thinking
 
-                raw_res, data, thinking = _run_local_review(
-                    local_chapter_review_prompt
-                )
+                raw_res, data, thinking = _run_local_review(local_chapter_review_prompt)
 
                 print(f"[Logic Debug] Chapter {i+1} Raw Response (first 500 chars):")
                 print(raw_res[:500])
@@ -487,18 +603,16 @@ class LogicAgent:
                     f"\n#### Chapter {i+1}: {chap['title']}\n{thinking}\n"
                 )
 
-                local_summary = data.get("local_summary") if isinstance(data, dict) else ""
+                local_summary = (
+                    data.get("local_summary") if isinstance(data, dict) else ""
+                )
                 if not local_summary or local_summary == "None":
-                    local_summary = (
-                        f"[摘要解析失败] 第{i+1}章《{chap['title']}》的摘要未能正确生成，可能因为模型输出不完整或JSON格式错误。"
-                    )
+                    local_summary = f"[摘要解析失败] 第{i+1}章《{chap['title']}》的摘要未能正确生成，可能因为模型输出不完整或JSON格式错误。"
                     print(
                         f"[Logic WARNING] Chapter {i+1} local_summary 为空或None，已使用兜底文本"
                     )
 
-                print(
-                    f"[Logic Debug] Chapter {i+1} Parsed Summary: '{local_summary}'"
-                )
+                print(f"[Logic Debug] Chapter {i+1} Parsed Summary: '{local_summary}'")
                 print(f"[Logic Debug] Summary Length: {len(local_summary)}")
 
                 memory_entry = {
@@ -553,9 +667,7 @@ class LogicAgent:
 
             except Exception as e:
                 print(f"[Logic] Failed to review chapter {i+1}: {e}")
-                fallback_summary = (
-                    f"[审查失败] 第{i+1}章《{chap['title']}》审查过程中出现异常：{str(e)}"
-                )
+                fallback_summary = f"[审查失败] 第{i+1}章《{chap['title']}》审查过程中出现异常：{str(e)}"
 
                 self.logic_memory.append(
                     {
@@ -642,6 +754,14 @@ class LogicAgent:
 
             global_data = self.doc_agent._parse_json(raw_res)
 
+            # 处理两种可能的返回格式：{"issues": [...]} 或 [{...}, {...}]
+            if isinstance(global_data, list):
+                global_issues = global_data
+            elif isinstance(global_data, dict):
+                global_issues = global_data.get("issues", [])
+            else:
+                global_issues = []
+
             thinking_match = re.search(
                 r"<thinking>(.*?)</thinking>", raw_res, re.DOTALL
             )
@@ -654,7 +774,7 @@ class LogicAgent:
             all_issues = []
             for res in map_results:
                 all_issues.extend(res["issues"])
-            all_issues.extend(global_data.get("issues", []))
+            all_issues.extend(global_issues)
 
             print(
                 "\n[Fact Conflict Detection] Starting cross-chapter fact verification..."
@@ -700,23 +820,6 @@ class LogicAgent:
                 + f"[Error] 全局分析失败：{e}",
             }
 
-    def run_normative_logic_review(self) -> str:
-        """Lightweight normative + logic review without tool calls; returns JSON string."""
-        outline_xml = self.doc_agent.get_outline()
-        body_text = self.doc_agent._extract_plain_text()
-        messages = [
-            {"role": "system", "content": normative_logic_prompt},
-            {
-                "role": "user",
-                "content": f"大纲：\n{outline_xml}\n\n正文片段：\n{body_text}\n\n请按约定输出 JSON。",
-            },
-        ]
-        try:
-            response = self.doc_agent._call_llm(
-                messages, max_tokens=800, temperature=0.0
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            return json.dumps(
-                {"issues": [], "error": f"normative_logic_review_failed: {e}"}
-            )
+    # NOTE: run_normative_logic_review() has been removed
+    # This method is deprecated as normative and logic reviews have been separated
+    # into NormativeAgent and LogicAgent respectively.

@@ -7,7 +7,7 @@ import argparse
 import json
 import os
 import shutil
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from dotenv import load_dotenv
 import re
@@ -22,76 +22,57 @@ class ImprovedJsonProcessor:
     """
 
     def __init__(self):
-        self.heading_pattern = re.compile(r'^(\d+\.|\d+\.\d+\.|第.+章)')
+        self.heading_pattern = re.compile(r"^(\d+\.|\d+\.\d+\.|第.+章)")
 
     def _normalize_header_text(self, text: str) -> str:
         return " ".join(str(text).strip().split())
 
-    def _infer_page_bounds(self, elements: list) -> Dict[int, float]:
-        page_max_y = {}
-        for element in elements:
-            page_idx = element.get("page_idx", 0)
-            bbox = element.get("bbox", [])
-            if isinstance(bbox, list) and len(bbox) >= 4:
-                try:
-                    max_y = float(bbox[3])
-                except Exception:
-                    continue
-                if page_idx not in page_max_y or max_y > page_max_y[page_idx]:
-                    page_max_y[page_idx] = max_y
-        return page_max_y
+    def _extract_table_data(
+        self, element: dict
+    ) -> Tuple[str, Optional[str], Optional[str]]:
+        """
+        简化版：优先读顶层字段，兼容嵌套 blocks
+        - content_list.json：直接有 table_body / img_path / table_caption
+        - layout.json：从嵌套 blocks 提取（兼容）
+        """
+        # 1. 优先读顶层字段（MinerU 标准格式）
+        content = (element.get("table_body") or "").strip()
+        image_path = element.get("img_path") or element.get("image_path")
 
-    def _collect_header_footer_candidates(self, elements: list) -> Dict[str, set]:
-        page_max_y = self._infer_page_bounds(elements)
-        header_pages: Dict[str, set] = {}
-        footer_pages: Dict[str, set] = {}
-        page_indices = {element.get("page_idx", 0) for element in elements}
-        page_count = max(page_indices) + 1 if page_indices else 0
-        min_pages = max(2, int(page_count * 0.6))
+        # 2. Caption：直接用 table_caption（MinerU 真源）
+        caption = element.get("table_caption")
+        if isinstance(caption, list):
+            caption = caption[0] if caption else None
+        if isinstance(caption, str):
+            caption = caption.strip() or None
 
-        for element in elements:
-            etype = (element.get("type") or "").lower()
-            if etype not in ["text", "paragraph"]:
-                continue
-            content = (element.get("content") or element.get("text") or "").strip()
-            if not content:
-                continue
-            cleaned = self._normalize_header_text(content)
-            if len(cleaned) > 80:
-                continue
+        # 3. 如果顶层有数据，直接返回
+        if content or image_path:
+            return (content or "", caption, image_path)
 
-            page_idx = element.get("page_idx", 0)
-            bbox = element.get("bbox", [])
-            if not (isinstance(bbox, list) and len(bbox) >= 4):
-                continue
-            page_height = page_max_y.get(page_idx)
-            if not page_height:
-                continue
+        # 4. 兼容 layout.json：从嵌套 blocks 提取
+        for block in element.get("blocks") or []:
+            btype = (block.get("type") or "").lower()
+            if btype == "table_body":
+                for line in block.get("lines") or []:
+                    for span in line.get("spans") or []:
+                        if not content:
+                            content = (
+                                span.get("html")
+                                or span.get("content")
+                                or span.get("text")
+                                or ""
+                            ).strip()
+                        if not image_path:
+                            image_path = span.get("image_path")
+                        if content and image_path:
+                            break
+                    if content and image_path:
+                        break
+                if content or image_path:
+                    break
 
-            try:
-                y1 = float(bbox[1])
-                y2 = float(bbox[3])
-            except Exception:
-                continue
-
-            top_thresh = page_height * 0.12
-            bottom_thresh = page_height * 0.88
-            if y2 <= top_thresh:
-                header_pages.setdefault(cleaned, set()).add(page_idx)
-            elif y1 >= bottom_thresh:
-                footer_pages.setdefault(cleaned, set()).add(page_idx)
-
-        header_candidates = {
-            text for text, pages in header_pages.items() if len(pages) >= min_pages
-        }
-        footer_candidates = {
-            text for text, pages in footer_pages.items() if len(pages) >= min_pages
-        }
-        return {
-            "header": header_candidates,
-            "footer": footer_candidates,
-            "page_max_y": page_max_y,
-        }
+        return (content or "", caption, image_path)
 
     def process(self, root_path):
         """
@@ -155,11 +136,6 @@ class ImprovedJsonProcessor:
             print(f"[Warning] JSON 中未找到有效数据")
             return None
 
-        header_footer_info = self._collect_header_footer_candidates(elements)
-        header_texts = header_footer_info["header"]
-        footer_texts = header_footer_info["footer"]
-        page_max_y = header_footer_info["page_max_y"]
-
         # 构建 DataFrame
         records = []
         curr_page = -1
@@ -170,15 +146,17 @@ class ImprovedJsonProcessor:
             page_idx = element.get("page_idx", 0)
             if page_idx > curr_page:
                 curr_page = page_idx
-                records.append({
-                    "para_text": None,
-                    "style": "Page_Start",
-                    "table_id": str(page_idx + 1),
-                    "font_size": None,
-                    "font_family": None,
-                    "bbox": None,
-                    "page_idx": page_idx,
-                })
+                records.append(
+                    {
+                        "para_text": None,
+                        "style": "Page_Start",
+                        "table_id": str(page_idx + 1),
+                        "font_size": None,
+                        "font_family": None,
+                        "bbox": None,
+                        "page_idx": page_idx,
+                    }
+                )
 
             etype = element.get("type", "").lower()
             content = (element.get("content") or element.get("text") or "").strip()
@@ -193,33 +171,36 @@ class ImprovedJsonProcessor:
             if not content and etype not in ["image", "figure", "table"]:
                 continue
 
-            # 判定页眉/页脚
-            header_footer_style = None
-            if etype in ["text", "paragraph"] and content:
-                cleaned = self._normalize_header_text(content)
-                if cleaned in header_texts or cleaned in footer_texts:
-                    if isinstance(bbox, list) and len(bbox) >= 4:
-                        page_height = page_max_y.get(page_idx)
-                        if page_height:
-                            try:
-                                y1 = float(bbox[1])
-                                y2 = float(bbox[3])
-                            except Exception:
-                                y1 = y2 = None
-                            if y1 is not None and y2 is not None:
-                                top_thresh = page_height * 0.12
-                                bottom_thresh = page_height * 0.88
-                                if cleaned in header_texts and y2 <= top_thresh:
-                                    header_footer_style = "Header"
-                                elif cleaned in footer_texts and y1 >= bottom_thresh:
-                                    header_footer_style = "Footer"
+            if etype == "discarded":
+                # 区分页眉和页脚：根据 bbox 的 y 坐标判断位置
+                bbox = element.get("bbox")
+                if bbox and len(bbox) >= 4:
+                    # bbox[1] 是 y0（顶部坐标），值越小越靠近页面顶部
+                    # 简单判断：如果在页面上半部分，认为是页眉，否则是页脚
+                    # 可以根据实际情况调整阈值
+                    page_height = 842  # A4 纸的默认高度（pt），可以从 page_size 获取
+                    y_position = bbox[1]
 
-            if header_footer_style:
-                style, item_id = header_footer_style, None
+                    if y_position < page_height * 0.15:  # 上方 15%
+                        style, item_id = "Header", None
+                    elif y_position > page_height * 0.85:  # 下方 15%
+                        style, item_id = "Footer", None
+                    else:
+                        # 中间区域的 discarded，可能是误判，仍标记为 Discarded
+                        style, item_id = "Discarded", None
+                else:
+                    # 没有 bbox 信息，默认标记为 Discarded
+                    style, item_id = "Discarded", None
             else:
                 # 判定样式
                 style, item_id = self._determine_style_improved(
-                    etype, content, font_size, text_level, element, image_count, table_count
+                    etype,
+                    content,
+                    font_size,
+                    text_level,
+                    element,
+                    image_count,
+                    table_count,
                 )
 
             # 更新计数器
@@ -227,29 +208,33 @@ class ImprovedJsonProcessor:
                 image_count += 1
                 content = item_id
             elif style == "Table":
-                table_caption = (
-                    element.get("table_caption")
-                    or element.get("caption")
-                    or element.get("title")
-                    or element.get("name")
+                # 提取表格数据（优先用顶层字段）
+                table_content, table_caption, table_img_path = self._extract_table_data(
+                    element
                 )
-                if isinstance(table_caption, list):
-                    table_caption = table_caption[0] if table_caption else None
-                if isinstance(table_caption, str):
-                    table_caption = table_caption.strip() or None
-                if content or table_caption:
-                    content = {"content": content, "alt_text": table_caption}
+                if not table_content and isinstance(content, str):
+                    table_content = content
+
+                # 构建统一结构（与 Image 对齐）
+                content = {"content": table_content or "", "alt_text": table_caption}
+                # 表格图统一用 figures/ 前缀
+                if table_img_path:
+                    content["image_path"] = "figures/" + os.path.basename(
+                        table_img_path
+                    )
                 table_count += 1
 
-            records.append({
-                "para_text": content,
-                "style": style,
-                "table_id": item_id if style != "Image" else None,
-                "font_size": font_size,
-                "font_family": font_family,
-                "bbox": bbox,
-                "page_idx": page_idx,
-            })
+            records.append(
+                {
+                    "para_text": content,
+                    "style": style,
+                    "table_id": item_id if style != "Image" else None,
+                    "font_size": font_size,
+                    "font_family": font_family,
+                    "bbox": bbox,
+                    "page_idx": page_idx,
+                }
+            )
 
         if not records:
             print(f"[Warning] 未提取到有效内容")
@@ -286,16 +271,24 @@ class ImprovedJsonProcessor:
         if etype in ["caption", "figure_caption", "table_caption"]:
             return "Caption", None
 
+        # 2.5 页眉页脚：仅依赖 MinerU discarded
+        if etype == "discarded":
+            return "Discarded", None
+
         # 3. 图片
         if etype in ["image", "figure"]:
             img_path = element.get("img_path", f"image_{image_count}.png")
             image_data = {
                 "path": img_path,
-                "alt_text": element.get("image_caption", [""])[0] if element.get("image_caption") else None
+                "alt_text": (
+                    element.get("image_caption", [""])[0]
+                    if element.get("image_caption")
+                    else None
+                ),
             }
             return "Image", image_data
 
-        # 4. 表格
+        # 4. 表格：layout 中 "type": "table" 的顶层块即判为 Table
         if etype == "table":
             return "Table", table_count
 
@@ -336,7 +329,9 @@ class ImprovedJsonProcessor:
         # 字体大小统计
         font_df = df[df["font_size"].notna()]
         if not font_df.empty:
-            print(f"    Font size range: {font_df['font_size'].min():.1f} - {font_df['font_size'].max():.1f}")
+            print(
+                f"    Font size range: {font_df['font_size'].min():.1f} - {font_df['font_size'].max():.1f}"
+            )
 
 
 def main():
@@ -344,12 +339,14 @@ def main():
         description="改进版:处理 MinerU JSON 并生成带正确标题的 DataFrame"
     )
     parser.add_argument(
-        "--extract-data-dir", default="preprocess/extract_output/MinerU",
-        help="MinerU 输出目录"
+        "--extract-data-dir",
+        default="preprocess/extract_output/MinerU",
+        help="MinerU 输出目录",
     )
     parser.add_argument(
-        "--save-dir", default="preprocess/processed_output/MinerU",
-        help="最终处理结果目录"
+        "--save-dir",
+        default="preprocess/processed_output/MinerU",
+        help="最终处理结果目录",
     )
     parser.add_argument("--doc-id", type=str, default=None, help="指定要处理的文档ID")
     args = parser.parse_args()
@@ -382,6 +379,7 @@ def main():
         old_pkl = os.path.join(save_path, "data.pkl")
         if os.path.exists(old_pkl):
             import shutil
+
             shutil.copy(old_pkl, old_pkl + ".backup")
             print(f"[Backup] Old file backed up to data.pkl.backup")
 

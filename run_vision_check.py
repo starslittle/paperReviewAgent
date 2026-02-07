@@ -1,21 +1,24 @@
 """
 简化的图文一致性检查脚本
 """
+
 import os
 import sys
 
 from dotenv import load_dotenv
 
 # 设置 UTF-8 编码
-if sys.platform == 'win32':
+if sys.platform == "win32":
     import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-load_dotenv(override=True, encoding='utf-8')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
+load_dotenv(override=True, encoding="utf-8")
 
 # 添加路径
 sys.path.insert(0, os.getcwd())
+
 
 def main():
     print("=" * 80)
@@ -33,12 +36,27 @@ def main():
 
     print(f"\n[1/3] Loading document: {doc_id}")
     from agent import doc_agent
+    from agent import doc_reader
     from agent.vision_agent import VisionAgent
-    from preprocess.doc_reader import DocReader
-    reader = DocReader(data_path=data_path)
+
+    # 使用预处理生成的 outline XML
+    save_dir = "sample_results"
+    outline_path = os.path.join(save_dir, f"outline_{doc_id}.xml")
+
+    if not os.path.exists(outline_path):
+        print(f"[ERROR] Outline XML not found: {outline_path}")
+        print(
+            f"[HINT] Please run preprocessing first: ./scripts/run_pipeline.ps1 -DocName {doc_id}"
+        )
+        return
+
+    reader = doc_reader.OutlineOnlyReader(
+        outline_path=outline_path,
+        data_path=data_path,
+    )
     print(f"  - Total pages: {reader.num_page}")
-    print(f"  - Images: {reader.image_count}")
-    print(f"  - Tables: {reader.table_count}")
+    print(f"  - Images: {len(reader.image_path_dict)}")
+    print(f"  - Tables: {len(reader.table_image_path_dict)}")
 
     # 初始化 Agent
     api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -93,7 +111,9 @@ def main():
     except Exception as e:
         print(f"[ERROR] Vision review failed: {e}")
         import traceback
+
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()

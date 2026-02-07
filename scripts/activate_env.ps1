@@ -15,8 +15,11 @@ Write-Host "常用命令:" -ForegroundColor Yellow
 Write-Host "  # 为 bylw-pgy 运行完整预处理流程" -ForegroundColor Cyan
 Write-Host "  .\run_pipeline.ps1 -DocName 'bylw-pgy'" -ForegroundColor White
 Write-Host ""
-Write-Host "  # 或分别运行:" -ForegroundColor Cyan
-Write-Host "  python preprocess/1_run_pdf_extract.py --raw-data-dir ./data --result-dir preprocess/extract_output --doc-id bylw-pgy" -ForegroundColor White
-Write-Host "  python preprocess/2_process_extracted_data.py --extract-data-dir preprocess/extract_output/MinerU --save-dir preprocess/processed_output/MinerU --doc-id bylw-pgy" -ForegroundColor White
-Write-Host "  python preprocess/3_make_page_images.py --raw-data-dir ./data/bylw-pgy --save-dir preprocess/processed_output/MinerU --resolution 144" -ForegroundColor White
-Write-Host "  python preprocess/4_build_xml_tree.py --processed-dir preprocess/processed_output/MinerU --doc-id bylw-pgy --output-dir sample_results" -ForegroundColor White
+Write-Host "  # 或使用新的统一入口:" -ForegroundColor Cyan
+Write-Host "  python preprocess/run_pipeline.py --doc-id bylw-pgy --with-page-images" -ForegroundColor White
+Write-Host ""
+Write-Host "  # 或分别运行 (旧方式,已重构):" -ForegroundColor Cyan
+Write-Host "  python preprocess/step1_extract.py --raw-data-dir ./data --result-dir preprocess/extract_output --doc-id bylw-pgy" -ForegroundColor White
+Write-Host "  python preprocess/step2_process.py --extract-data-dir preprocess/extract_output/MinerU --save-dir preprocess/processed_output/MinerU --doc-id bylw-pgy" -ForegroundColor White
+Write-Host "  python preprocess/step3_build_docir.py --processed-dir preprocess/processed_output/MinerU --doc-id bylw-pgy --output-dir sample_results" -ForegroundColor White
+Write-Host "  python preprocess/tool_make_page_images.py --raw-data-dir ./data/bylw-pgy --save-dir preprocess/processed_output/MinerU --resolution 144" -ForegroundColor White

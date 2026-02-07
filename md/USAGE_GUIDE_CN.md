@@ -5,13 +5,17 @@
 ## 📋 环境准备
 
 ### 1. 基础依赖安装
+
 在项目根目录下执行：
+
 ```bash
 pip install pdfservices-sdk openpyxl pandas PyMuPDF openai pillow python-dotenv
 ```
 
 ### 2. OCR 依赖安装（可选，推荐）
+
 如果需要使用 OCR 标题修正功能，请安装 PaddlePaddle 和 PaddleOCR：
+
 - **CPU 版本**:
   ```bash
   pip install paddlepaddle paddleocr
@@ -22,7 +26,9 @@ pip install pdfservices-sdk openpyxl pandas PyMuPDF openai pillow python-dotenv
   ```
 
 ### 3. 配置 API 密钥
+
 在项目根目录下创建 `.env` 文件，并填写以下配置：
+
 ```env
 # Adobe PDF Services (用于初步提取)
 ADOBE_CLIENT_ID=你的_adobe_id
@@ -43,9 +49,11 @@ cd preprocess
 ```
 
 ### 步骤 1：Adobe PDF 结构化提取
+
 将原始 PDF 转换为中间 XML 格式：
+
 ```bash
-python 1_run_pdf_extract.py --raw-data-dir ../data/ --result-dir ./extract_output/
+python 1_run_file_extract.py --raw-data-dir ../data/ --result-dir ./extract_output/
 ```
 
 ### 步骤 2：标题增强与修正 (OCR 或 Vision)
@@ -53,22 +61,29 @@ python 1_run_pdf_extract.py --raw-data-dir ../data/ --result-dir ./extract_outpu
 你可以选择使用 PaddleOCR 或 视觉大模型 (VLM) 来修正标题：
 
 #### 选项 A：使用 PaddleOCR (传统方案)
+
 进入 `paddleocr` 目录运行：
+
 ```powershell
 cd paddleocr
 .\run_ocr_process.ps1 -DocId bylw -OcrMaxPages 50
 ```
 
 #### 选项 B：使用视觉大模型 (VLM) 校验 (推荐新方案)
+
 在 `preprocess` 目录下运行，使用 Qwen-VL 等多模态模型进行视觉布局分析：
+
 ```powershell
 cd preprocess
 python 2_process_extracted_data.py --use-vision --doc-id bylw --ocr-max-pages 10
 ```
-*注：此方案会自动生成页面图像并调用 API 进行校验，效果更精准，能有效防止正文被误判为标题。*
+
+_注：此方案会自动生成页面图像并调用 API 进行校验，效果更精准，能有效防止正文被误判为标题。_
 
 ### 步骤 3：生成页面图像
+
 为视觉审查代理（Vision Agent）准备图像数据：
+
 ```bash
 python 3_make_page_images.py --raw-data-dir ../data/ --save-dir ./processed_output/
 ```
@@ -84,12 +99,14 @@ cd ..
 ```
 
 ### 1. 运行单个文档审查
+
 ```bash
 # 替换 bylw 为你的文档文件夹名称
 python review_runner.py --doc-id bylw
 ```
 
 ### 2. 批量运行实验
+
 ```bash
 python run_experiment.py --preprocessed-data-dir ./preprocess/processed_output/ --save-dir ./sample_results/
 ```
@@ -99,13 +116,17 @@ python run_experiment.py --preprocessed-data-dir ./preprocess/processed_output/ 
 ## 🔍 第三阶段：查看结果
 
 ### 1. 查看审查报告
+
 审查完成后，结果将保存在 `sample_results/` 目录下：
+
 - `review_[doc_id].json`: 详细的问题列表和页码。
 - `report_[doc_id].html`: 可视化的 HTML 报告。
 - `outline_[doc_id].xml`: 提取出的文档大纲。
 
 ### 2. 验证预处理数据 (Debug)
+
 如果你想检查 OCR 修正后的中间数据，可以运行：
+
 ```bash
 cd preprocess
 python view_data.py ./processed_output/bylw/data.pkl

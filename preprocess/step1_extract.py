@@ -1,6 +1,7 @@
 """
-MinerU PDF 提取脚本
-功能：使用 MinerU API 解析 PDF，提取文本、字体、布局等信息
+MinerU 统一文件提取脚本 (step1_extract)
+功能：使用 MinerU API 解析文档，提取文本、字体、布局等信息。
+支持：PDF、DOC、DOCX（同一链路，API 见 https://mineru.net/apiManage/docs ）
 """
 
 import argparse
@@ -17,6 +18,7 @@ from dotenv import load_dotenv
 try:
     # 用于 API 交互
     from curl_cffi import requests as cffi_requests
+
     # 用于文件上传
     import requests as std_requests
 except ImportError:
@@ -58,12 +60,12 @@ class MinerUExtractor:
             logger.error("未找到 MINERU_API_TOKEN，请检查环境变量配置")
             exit(1)
 
-    def extract_pdf(self, pdf_path, sid, result_dir):
+    def extract_file(self, file_path, sid, result_dir):
         """
-        使用 MinerU API 提取 PDF 内容
+        使用 MinerU API 提取文档内容（PDF/DOC/DOCX 等）
 
         Args:
-            pdf_path: PDF 文件路径
+            file_path: 文档文件路径
             sid: 文档 ID
             result_dir: 结果输出根目录
 
@@ -80,7 +82,7 @@ class MinerUExtractor:
             return True
 
         # 1. 提交任务 (申请链接 -> 上传文件)
-        batch_id = self._submit_task(pdf_path)
+        batch_id = self._submit_task(file_path)
         if not batch_id:
             return False
 
@@ -95,14 +97,14 @@ class MinerUExtractor:
             logger.info(f"[✓] 文档 {sid} 处理完成")
         return success
 
-    def _submit_task(self, pdf_path):
+    def _submit_task(self, file_path):
         """
         步骤一：提交任务
         1. 申请上传链接
         2. 上传文件
         """
         apply_url = f"{self.base_url}/file-urls/batch"
-        filename = os.path.basename(pdf_path)
+        filename = os.path.basename(file_path)
 
         try:
             logger.info(f"[→] 正在申请上传链接: {filename}")
@@ -129,7 +131,7 @@ class MinerUExtractor:
             logger.info("[→] 链接申请成功，正在上传文件数据...")
 
             # 2. 上传文件 (使用标准 requests，不带额外 Header)
-            with open(pdf_path, "rb") as f:
+            with open(file_path, "rb") as f:
                 file_content = f.read()
 
                 # 直接 PUT 二进制，timeout 设置长一点
@@ -263,9 +265,7 @@ class MinerUExtractor:
                     logger.info(f"[✓] 已将 {found_json} 移动并重命名为 middle.json")
                 return True
             else:
-                logger.warning(
-                    "[!] 未找到 middle.json，请检查上方打印的文件列表"
-                )
+                logger.warning("[!] 未找到 middle.json，请检查上方打印的文件列表")
                 return False
 
         except Exception as e:
@@ -274,10 +274,8 @@ class MinerUExtractor:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MinerU PDF 提取脚本")
-    parser.add_argument(
-        "--raw-data-dir", default="../data/", help="原始数据目录"
-    )
+    parser = argparse.ArgumentParser(description="MinerU 统一文件提取 (PDF/DOC/DOCX)")
+    parser.add_argument("--raw-data-dir", default="../data/", help="原始数据目录")
     parser.add_argument(
         "--result-dir", default="preprocess/extract_output", help="输出结果目录"
     )
@@ -288,7 +286,7 @@ def main():
     extractor = MinerUExtractor()
 
     search_path = os.path.join(args.raw_data_dir, "*")
-    pdf_count = 0
+    doc_count = 0
 
     all_items = glob.glob(search_path)
     for item in all_items:
@@ -298,21 +296,30 @@ def main():
         if args.doc_id and sid != args.doc_id:
             continue
 
-        # 查找PDF
+        # 查找待提取文件：优先 PDF，其次 DOCX/DOC（MinerU API 支持 pdf、doc、ppt、图片）
+        doc_path = None
         pdf_list = glob.glob(os.path.join(item, "*.pdf"))
-        if not pdf_list:
-            if os.path.exists(os.path.join(item, "document.pdf")):
-                pdf_list = [os.path.join(item, "document.pdf")]
-            else:
-                continue
+        if pdf_list:
+            doc_path = pdf_list[0]
+        elif os.path.exists(os.path.join(item, "document.pdf")):
+            doc_path = os.path.join(item, "document.pdf")
+        else:
+            # 支持 docx/doc，走与 PDF 相同的 MinerU 链路
+            for ext in ("*.docx", "*.doc"):
+                docx_list = glob.glob(os.path.join(item, ext))
+                if docx_list:
+                    doc_path = docx_list[0]
+                    break
+        if not doc_path:
+            continue
 
-        pdf_count += 1
+        doc_count += 1
         logger.info(f"\n{'='*60}")
-        logger.info(f"[{pdf_count}] 处理文档: {sid}")
+        logger.info(f"[{doc_count}] 处理文档: {sid} -> {os.path.basename(doc_path)}")
         logger.info(f"{'='*60}")
-        extractor.extract_pdf(pdf_list[0], sid, args.result_dir)
+        extractor.extract_file(doc_path, sid, args.result_dir)
 
-    logger.info(f"\n[✓] 全部处理完成，共处理 {pdf_count} 个文档")
+    logger.info(f"\n[✓] 全部处理完成，共处理 {doc_count} 个文档")
 
 
 if __name__ == "__main__":
