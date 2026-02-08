@@ -78,6 +78,13 @@ def parse_args():
         default="https://dashscope.aliyuncs.com/compatible-mode/v1",
         help="Base URL for vision model",
     )
+    parser.add_argument(
+        "--thesis-type",
+        type=str,
+        choices=["auto", "system", "algorithm"],
+        default="auto",
+        help="论文类型: auto(自动检测) / system(程序开发类) / algorithm(算法理论类)",
+    )
     # 已废弃：不再支持并行模式，只使用串行结构化流程
     # parser.add_argument(
     #     "--no-parallel",
@@ -195,7 +202,13 @@ def main():
         def run_logic_outline():
             try:
                 print("[Agent] [Logic] Thread started...")
-                result = LogicAgent(agent).run()
+                result = LogicAgent(
+                    agent,
+                    thesis_type=args.thesis_type,
+                    vision_model_id=args.vision_model,
+                    vision_api_key=args.vision_api_key,
+                    vision_base_url=args.vision_base_url,
+                ).run()
                 print("[Agent] [Logic] Thread completed ✓")
                 return result
             except Exception as e:
@@ -264,6 +277,7 @@ def main():
             "normative_issues": normative_data.get("issues", []),
             "logic_issues": logic_data.get("issues", []),
             "vision_issues": vision_data.get("issues", []),
+            "toc_suggestion": logic_data.get("toc_suggestion", {}),
             "issues": (
                 normative_data.get("issues", [])
                 + logic_data.get("issues", [])
@@ -331,7 +345,13 @@ def main():
             """并行任务：逻辑性审查"""
             try:
                 print("[Agent] [Logic] Thread started...")
-                result = LogicAgent(agent).run()
+                result = LogicAgent(
+                    agent,
+                    thesis_type=args.thesis_type,
+                    vision_model_id=args.vision_model,
+                    vision_api_key=args.vision_api_key,
+                    vision_base_url=args.vision_base_url,
+                ).run()
                 print("[Agent] [Logic] Thread completed ✓")
                 return result
             except Exception as e:
@@ -413,6 +433,7 @@ def main():
             "normative_issues": normative_issues,
             "logic_issues": logic_issues,
             "vision_issues": vision_issues,
+            "toc_suggestion": logic_out.get("parsed", {}).get("toc_suggestion", {}),
             "issues": normative_issues + logic_issues + vision_issues,
         }
 

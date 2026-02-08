@@ -6,7 +6,7 @@ DocAgent 预处理流程统一入口
     Step 2: Process -> 清洗与标准化数据
     Step 3: Build DocIR -> 构建文档结构与 XML 树
 
-可选步骤：
+可选步骤（默认开启）：
     Tool: Make Page Images -> 生成页面图（用于视觉展示）
 
 用法示例：
@@ -19,8 +19,11 @@ DocAgent 预处理流程统一入口
     # 只生成页面图
     python run_pipeline.py --doc-id bylw-zx --only-page-images
 
-    # 包含页面图生成
+    # 包含页面图生成（默认开启）
     python run_pipeline.py --doc-id bylw-zx --with-page-images
+
+    # 关闭页面图生成（不推荐，逻辑审查会缺少封面图）
+    python run_pipeline.py --doc-id bylw-zx --no-page-images
 """
 
 import argparse
@@ -69,7 +72,7 @@ def main():
     # 只运行 DocIR 构建
     python run_pipeline.py --doc-id bylw-zx --skip-extract --skip-process
     
-    # 包含页面图生成
+    # 包含页面图生成（默认开启）
     python run_pipeline.py --doc-id bylw-zx --with-page-images
     
     # 只生成页面图（独立工具）
@@ -120,9 +123,18 @@ def main():
         "--skip-build", action="store_true", help="跳过 Step 3: Build DocIR"
     )
 
-    # 可选工具
+    # 可选工具（默认开启页面图生成）
     parser.add_argument(
-        "--with-page-images", action="store_true", help="在主流程后生成页面图（可选）"
+        "--with-page-images",
+        action="store_true",
+        default=True,
+        help="在主流程后生成页面图（默认开启）",
+    )
+    parser.add_argument(
+        "--no-page-images",
+        action="store_false",
+        dest="with_page_images",
+        help="关闭页面图生成（不推荐）",
     )
     parser.add_argument(
         "--only-page-images", action="store_true", help="只生成页面图（跳过主流程）"

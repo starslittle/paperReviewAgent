@@ -44,6 +44,10 @@ def generate_html(json_path, output_path):
         "（未记录：视觉审查的思考过程为空。若使用最新代码，VisionAgent 会汇总决策轨迹；请用 review_runner 重新跑一遍并生成报告。）",
     )
 
+    toc_suggestion = data.get("toc_suggestion") or {}
+    toc_summary = (toc_suggestion.get("summary") or "").strip()
+    toc_outline = toc_suggestion.get("suggested_outline") or []
+
     # 统计
     high_count = len([i for i in issues if i.get("severity") == "High"])
     medium_count = len([i for i in issues if i.get("severity") == "Medium"])
@@ -241,6 +245,21 @@ def generate_html(json_path, output_path):
                     {vision_thinking}
                 </div>
             </div>
+
+            {f'''
+            <div class="thinking-box" style="margin-bottom: 30px; border-left: 4px solid #3498db;">
+                <div class="thinking-header" onclick="toggle('toc_suggestion')" style="background: #e8f4fc;">
+                    <span>📑 目录检测：AI 总建议与修改后的推荐目录</span>
+                    <span>▶</span>
+                </div>
+                <div id="toc_suggestion" class="thinking-content" style="display: none; padding: 20px; background: #fff;">
+                    <p><strong>总建议：</strong></p>
+                    <p style="margin-left: 1em; line-height: 1.6;">{escape_html(toc_summary) or "（无）"}</p>
+                    <p style="margin-top: 16px;"><strong>修改后的推荐目录：</strong></p>
+                    <ul style="margin-left: 1.5em; line-height: 1.8; list-style: none; padding-left: 0;">{"".join(f"<li>{escape_html(line)}</li>" for line in toc_outline)}</ul>
+                </div>
+            </div>
+            ''' if (toc_summary or toc_outline) else ""}
 
             <div style="clear: both; margin-top: 40px; border-top: 2px solid #eee; padding-top: 20px;">
                 <h2>📝 详细修改建议</h2>

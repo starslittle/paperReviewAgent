@@ -7,6 +7,7 @@
 
 import base64
 import copy
+import glob
 import os
 import xml.etree.ElementTree as ET
 from typing import Optional, Tuple
@@ -176,11 +177,23 @@ class OutlineOnlyReader:
         if self.data_path:
             self.page_images_dir = os.path.join(self.data_path, "page_images")
 
+        # MinerU 提取阶段会生成 *_origin.pdf，可作为页面图来源（无 page_images 时回退）
+        self._origin_pdf_path = None
         repo_root = (
             os.path.abspath(os.path.join(self.data_path, "..", "..", "..", ".."))
             if self.data_path
             else os.path.abspath(os.path.join(os.path.dirname(self.outline_path), ".."))
         )
+        for extract_dir in (
+            os.path.join(repo_root, "preprocess", "extract_output", "MinerU", doc_id),
+            os.path.join(repo_root, "extract_output", "MinerU", doc_id),
+        ):
+            if os.path.isdir(extract_dir):
+                candidates = glob.glob(os.path.join(extract_dir, "*_origin.pdf"))
+                if candidates:
+                    self._origin_pdf_path = candidates[0]
+                    break
+
         image_candidate_dirs = [
             os.path.join(
                 repo_root, "preprocess", "extract_output", "MinerU", doc_id, "images"
@@ -404,19 +417,39 @@ class OutlineOnlyReader:
 
     def get_page_image(self, page_num):
         """
-        获取页面截图
-
-        Args:
-            page_num: 页码
-
-        Returns:
-            Tuple[media_type, base64_image, error]
+        获取页面截图。优先使用 processed_output 下的 page_images；
+        若不存在则从 MinerU 生成的 *_origin.pdf 中按页渲染（无需单独生成首页图）。
         """
-        if not self.page_images_dir:
-            return "", "", "Outline-only reader does not support page images"
-        index_string = "%04d" % (int(page_num) - 1)
-        image_path = os.path.join(self.page_images_dir, f"page_{index_string}.png")
-        return process_image(image_path)
+        page_num = int(page_num)
+        index_zero = page_num - 1
+        if index_zero < 0:
+            return "", "", "Invalid page number"
+
+        # 1) 已有 page_images 目录则直接读文件
+        if self.page_images_dir:
+            index_string = "%04d" % index_zero
+            image_path = os.path.join(self.page_images_dir, f"page_{index_string}.png")
+            if os.path.isfile(image_path):
+                return process_image(image_path)
+
+        # 2) 回退：从 MinerU 的 *_origin.pdf 渲染该页
+        if getattr(self, "_origin_pdf_path", None) and os.path.isfile(self._origin_pdf_path):
+            try:
+                import fitz
+                with fitz.open(self._origin_pdf_path) as doc:
+                    if index_zero >= len(doc):
+                        return "", "", f"Page {page_num} out of range (pdf has {len(doc)} pages)"
+                    page = doc[index_zero]
+                    pix = page.get_pixmap(dpi=144)
+                    png_bytes = pix.tobytes(output="png")
+                b64 = base64.b64encode(png_bytes).decode("utf-8")
+                return "image/png", b64, None
+            except Exception as e:
+                return "", "", f"Failed to render page from MinerU PDF: {e}"
+
+        if self.page_images_dir:
+            return "", "", f"Page image not found: page_{index_zero:04d}.png"
+        return "", "", "Outline-only reader does not support page images"
 
     def get_table_image(self, table_id):
         """
