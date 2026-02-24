@@ -1528,6 +1528,26 @@ class VisionAgent:
         issues: List[Dict[str, Any]] = []
 
         if role_assignment.confidence < 0.6:
+            evidence_sentence = role_assignment.evidence_sentence or ""
+            # 检测引用句是否过短（如只有"3."、"图3"等）
+            is_quote_too_short = (
+                evidence_sentence
+                and len(evidence_sentence.strip()) <= 10
+                and (
+                    re.match(r"^[\d图圖图\.\s]+$", evidence_sentence.strip())
+                    or evidence_sentence.strip() in ["图", "圖", "Figure", "Fig"]
+                )
+            )
+            
+            if is_quote_too_short:
+                suggestion = (
+                    f"当前引用句过短（如「{evidence_sentence.strip()}」），无法识别图像在论证中的作用。"
+                    f"请添加完整的图号引用描述，如「如图{self._get_figure_numbers(figure_node.figure_id, figure_node.caption)[0] if self._get_figure_numbers(figure_node.figure_id, figure_node.caption) else 'X'}所示，...」，"
+                    f"并补充对图像内容的说明，使图像在论证中的角色更清晰。"
+                )
+            else:
+                suggestion = "请明确图号引用句，使图像在论证中的角色更清晰。示例：将「结果如图所示」改为「如图3-11所示，Precision-Confidence曲线用于说明高置信度区间的精确率变化趋势」。"
+            
             issues.append(
                 {
                     "issue_type": "图文一致性",
@@ -1536,9 +1556,8 @@ class VisionAgent:
                     "page": figure_node.page_num,
                     "image_id": figure_node.figure_id,
                     "media_kind": media_kind,
-                    "quote": role_assignment.evidence_sentence
-                    or "未能可靠识别图像论证角色",
-                    "suggestion": "请明确图号引用句，使图像在论证中的角色更清晰。示例：将“结果如图所示”改为“如图3-11所示，Precision-Confidence曲线用于说明高置信度区间的精确率变化趋势”。",
+                    "quote": evidence_sentence or "未能可靠识别图像论证角色",
+                    "suggestion": suggestion,
                 }
             )
 
@@ -1710,15 +1729,39 @@ class VisionAgent:
         }
         prompt_text = build_suggestion_prompt(context, decision)
 
+        # 检测引用句是否过短（如只有"3."、"图3"等）
+        quote = issue.get("quote", "")
+        is_quote_too_short = (
+            quote
+            and len(quote.strip()) <= 10
+            and (
+                re.match(r"^[\d图圖图\.\s]+$", quote.strip())
+                or quote.strip() in ["图", "圖", "Figure", "Fig"]
+            )
+        )
+
         fallback_map = {
             "MODIFY_FIGURE": "建议补充或调整图像内容，使其能直接支撑文本主张，增加关键数据、标注或对比信息。",
-            "MODIFY_TEXT": "建议修订文字表述，使其与图像展示事实一致，避免过度结论并补充准确描述。",
-            "BOTH_LIGHT": "建议对图像与文字做轻微一致性调整，确保引用句与图像信息对齐。",
+            "MODIFY_TEXT": (
+                "建议添加完整的图号引用描述，如「如图X所示，...」，并补充对图像内容的说明，使其与图像展示事实一致。"
+                if is_quote_too_short
+                else "建议修订文字表述，使其与图像展示事实一致，避免过度结论并补充准确描述。"
+            ),
+            "BOTH_LIGHT": (
+                "建议添加完整的图号引用描述，如「如图X所示，...」，并补充对图像内容的说明，确保引用句与图像信息对齐。"
+                if is_quote_too_short
+                else "建议对图像与文字做轻微一致性调整，确保引用句与图像信息对齐。"
+            ),
         }
         fallback = fallback_map.get(
             decision.get("modification_target", "BOTH_LIGHT"),
             fallback_map["BOTH_LIGHT"],
         )
+        
+        # 如果引用句过短，在 prompt 中明确要求添加"如图...所示"
+        if is_quote_too_short and decision.get("modification_target") in ["MODIFY_TEXT", "BOTH_LIGHT"]:
+            prompt_text += "\n\n重要提示：当前引用句过短（如只有图号），请在建议中明确要求添加「如图X所示，...」的描述性文字，并说明图像内容。"
+        
         suggestion = self._generate_modification_suggestion(prompt_text, fallback)
 
         return {

@@ -48,6 +48,17 @@ def generate_html(json_path, output_path):
     toc_summary = (toc_suggestion.get("summary") or "").strip()
     toc_outline = toc_suggestion.get("suggested_outline") or []
 
+    def toc_line_level(line):
+        """根据目录行首编号推断层级：1 -> 0, 1.1 -> 1, 1.2.1 -> 2，以此类推。"""
+        s = (line or "").strip()
+        if not s:
+            return 0
+        match = re.match(r"^(\d+(?:\.\d+)*)\s*", s)
+        if not match:
+            return 0
+        num_part = match.group(1)
+        return max(0, num_part.count("."))
+
     # 统计
     high_count = len([i for i in issues if i.get("severity") == "High"])
     medium_count = len([i for i in issues if i.get("severity") == "Medium"])
@@ -81,29 +92,32 @@ def generate_html(json_path, output_path):
         "逻辑性",
         "语言",
         "连贯性",
+        "语义重复",
     }
-    normative_types = {"Format", "规范性"}
+    # 规范性类型（包含目录结构等）
+    normative_types = {"Format", "规范性", "目录结构", "章节结构", "编号问题", "格式问题"}
     vision_types = {"Vision", "图文一致性"}
 
     for issue in issues:
         raw_type = issue.get("issue_type", "Unknown")
         img_id = issue.get("image_id", "")
 
-        if img_id or raw_type in vision_types or "一致性" in raw_type:
-            vision_issues.append(issue)
-        elif raw_type in logic_types:
-            logic_issues.append(issue)
-        elif raw_type in normative_types:
+        # 先按 issue_type 分类，避免被 img_id 误分
+        if raw_type in normative_types or any(
+            key in raw_type for key in ["规范", "格式", "目录", "编号"]
+        ):
             normative_issues.append(issue)
+        elif raw_type in logic_types or any(
+            key in raw_type for key in ["逻辑", "语言", "连贯", "语义重复", "重复"]
+        ):
+            logic_issues.append(issue)
+        elif raw_type in vision_types or "图文一致性" in raw_type:
+            vision_issues.append(issue)
+        elif img_id:
+            # 没有明确类型但带图片，才归入视觉问题
+            vision_issues.append(issue)
         else:
-            if "一致性" in raw_type or "图" in raw_type or "视觉" in raw_type:
-                vision_issues.append(issue)
-            elif "逻辑" in raw_type or "语言" in raw_type or "连贯" in raw_type:
-                logic_issues.append(issue)
-            elif "格式" in raw_type or "规范" in raw_type:
-                normative_issues.append(issue)
-            else:
-                other_issues.append(issue)
+            other_issues.append(issue)
 
     # 在各分类内按页码排序
     normative_issues.sort(key=get_page_num)
@@ -156,6 +170,19 @@ def generate_html(json_path, output_path):
             .thinking-content pre code {{ background: none; color: inherit; padding: 0; }}
             .meta {{ font-size: 0.9em; color: #7f8c8d; margin-bottom: 5px; }}
             .empty-msg {{ color: #95a5a6; font-style: italic; padding: 10px; }}
+            /* 推荐目录样式（仅树状缩进，无左侧蓝线） */
+            .toc-outline-wrap {{ margin-top: 16px; }}
+            .toc-outline-box {{ background: #fafbfc; border: 1px solid #e9ecef; border-radius: 8px; padding: 20px 24px; }}
+            .toc-outline-title {{ font-size: 0.95em; font-weight: 600; margin-bottom: 14px; padding-bottom: 8px; border-bottom: 1px solid #e9ecef; color: #333; }}
+            .toc-outline-list {{ list-style: none; padding: 0; margin: 0; }}
+            .toc-item {{ padding: 5px 0 5px 0; line-height: 1.65; margin-bottom: 2px; }}
+            .toc-item:hover {{ background: rgba(0, 0, 0, 0.03); border-radius: 4px; }}
+            .toc-item-l0 {{ margin-left: 0; padding-left: 0; font-weight: 600; color: #333; font-size: 1em; }}
+            .toc-item-l1 {{ margin-left: 1.2em; padding-left: 0; font-weight: 500; color: #444; font-size: 0.98em; }}
+            .toc-item-l2 {{ margin-left: 2.4em; padding-left: 0; font-weight: normal; color: #555; font-size: 0.95em; }}
+            .toc-item-l3 {{ margin-left: 3.6em; padding-left: 0; font-weight: normal; color: #666; font-size: 0.93em; }}
+            .toc-item-l4 {{ margin-left: 4.8em; padding-left: 0; font-weight: normal; color: #777; font-size: 0.91em; }}
+            .toc-summary-block {{ background: #fff; border-radius: 8px; padding: 14px 18px; margin-bottom: 18px; border: 1px solid #e9ecef; color: #34495e; line-height: 1.7; }}
         </style>
         <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <script>
@@ -252,11 +279,14 @@ def generate_html(json_path, output_path):
                     <span>📑 目录检测：AI 总建议与修改后的推荐目录</span>
                     <span>▶</span>
                 </div>
-                <div id="toc_suggestion" class="thinking-content" style="display: none; padding: 20px; background: #fff;">
-                    <p><strong>总建议：</strong></p>
-                    <p style="margin-left: 1em; line-height: 1.6;">{escape_html(toc_summary) or "（无）"}</p>
-                    <p style="margin-top: 16px;"><strong>修改后的推荐目录：</strong></p>
-                    <ul style="margin-left: 1.5em; line-height: 1.8; list-style: none; padding-left: 0;">{"".join(f"<li>{escape_html(line)}</li>" for line in toc_outline)}</ul>
+                <div id="toc_suggestion" class="thinking-content" style="display: none; padding: 20px; background: #fafbfc;">
+                    {f'<div class="toc-summary-block"><strong>总建议：</strong><br>{escape_html(toc_summary)}</div>' if toc_summary else ""}
+                    <div class="toc-outline-wrap">
+                        <div class="toc-outline-title">修改后的推荐目录</div>
+                        <div class="toc-outline-box">
+                            <ul class="toc-outline-list">{"".join(f'<li class="toc-item toc-item-l{min(toc_line_level(line), 4)}">{escape_html(line)}</li>' for line in toc_outline)}</ul>
+                        </div>
+                    </div>
                 </div>
             </div>
             ''' if (toc_summary or toc_outline) else ""}
@@ -273,6 +303,7 @@ def generate_html(json_path, output_path):
         "Language": "语言",
         "Coherence": "连贯性",
         "Cohesion": "连贯性",
+        "语义重复": "语义重复",
         "Vision": "图文一致性",
         "EVIDENCE_GENERALIZATION": "证据外推",
         "Unknown": "未分类",
@@ -413,10 +444,10 @@ def generate_html(json_path, output_path):
     # 按类别渲染
     current_idx = 0
     current_idx = render_issues(
-        normative_issues, "📏 规范性一致性问题", current_idx, "cat_norm"
+        normative_issues, "📏 规范一致性问题", current_idx, "cat_norm"
     )
     current_idx = render_issues(
-        logic_issues, "🧠 逻辑性一致性问题", current_idx, "cat_logic"
+        logic_issues, "🧠 逻辑一致性问题", current_idx, "cat_logic"
     )
     current_idx = render_issues(
         vision_issues, "🖼️ 图文一致性问题", current_idx, "cat_vision"
@@ -444,8 +475,14 @@ if __name__ == "__main__":
     parser.add_argument("--result-dir", default="./sample_results/")
     args = parser.parse_args()
 
-    json_file = os.path.join(args.result_dir, f"review_{args.doc_id}.json")
-    html_file = os.path.join(args.result_dir, f"report_{args.doc_id}.html")
+    # 支持子文件夹布局：review/、report/
+    json_file = os.path.join(args.result_dir, "review", f"review_{args.doc_id}.json")
+    if not os.path.exists(json_file):
+        json_file = os.path.join(args.result_dir, f"review_{args.doc_id}.json")
+    report_subdir = os.path.join(args.result_dir, "report")
+    html_file = os.path.join(report_subdir, f"report_{args.doc_id}.html")
+    if not os.path.isdir(report_subdir):
+        os.makedirs(report_subdir, exist_ok=True)
 
     if os.path.exists(json_file):
         generate_html(json_file, html_file)

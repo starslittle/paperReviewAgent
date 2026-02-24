@@ -165,7 +165,9 @@ def main():
         return issues
 
     if not args.outline_path and args.doc_id:
-        auto_outline = Path(args.save_dir) / f"outline_{args.doc_id}.xml"
+        auto_outline = Path(args.save_dir) / "outline" / f"outline_{args.doc_id}.xml"
+        if not auto_outline.exists():
+            auto_outline = Path(args.save_dir) / f"outline_{args.doc_id}.xml"
         if auto_outline.exists():
             args.outline_path = str(auto_outline)
 
@@ -285,7 +287,9 @@ def main():
             ),
         }
 
-        result_file = Path(args.save_dir) / f"review_{doc_id}.json"
+        review_dir = Path(args.save_dir) / "review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        result_file = review_dir / f"review_{doc_id}.json"
         result_file.write_text(
             json.dumps(final_result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -297,7 +301,9 @@ def main():
         data_path = os.path.join(args.preprocessed_data_dir, doc_id)
 
         # 统一使用预处理生成的 outline XML（避免重复构建）
-        outline_path = Path(args.save_dir) / f"outline_{doc_id}.xml"
+        outline_path = Path(args.save_dir) / "outline" / f"outline_{doc_id}.xml"
+        if not outline_path.exists():
+            outline_path = Path(args.save_dir) / f"outline_{doc_id}.xml"
         if not outline_path.exists():
             print(f"[Skip] {doc_id}: outline XML not found at {outline_path}")
             print(
@@ -437,7 +443,9 @@ def main():
             "issues": normative_issues + logic_issues + vision_issues,
         }
 
-        out_path = Path(args.save_dir) / f"review_{doc_id}.json"
+        review_dir = Path(args.save_dir) / "review"
+        review_dir.mkdir(parents=True, exist_ok=True)
+        out_path = review_dir / f"review_{doc_id}.json"
         out_path.write_text(
             json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8"
         )

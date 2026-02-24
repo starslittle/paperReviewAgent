@@ -17,6 +17,7 @@ from .prompts import (
     table_of_contents_check_prompt,
     toc_final_suggestion_prompt,
     cover_title_vision_prompt,
+    system_development_chapter_hint,
 )
 
 
@@ -1148,15 +1149,7 @@ class LogicAgent:
                         selected_prompt = (
                             local_chapter_review_prompt
                             + "\n\n"
-                            + """
-【程序开发类论文特殊提示】
-本论文为程序开发类论文，请额外关注：
-- 需求分析章节：是否包含可行性分析、用例图、业务流程图
-- 系统设计章节：是否包含架构图、功能模块图、数据库设计（E-R图+表结构）
-- 系统实现章节：是否包含关键代码片段和功能截图
-- 系统测试章节：是否包含测试用例表格（输入、操作、预期、实际）
-- 技术栈一致性：摘要、设计、实现中提到的技术栈是否一致
-"""
+                            + system_development_chapter_hint
                         )
                         print(f"[Logic] 使用程序开发类增强审查prompt")
 

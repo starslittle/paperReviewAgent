@@ -110,6 +110,8 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    outline_dir = os.path.join(args.output_dir, "outline")
+    os.makedirs(outline_dir, exist_ok=True)
     builder = DocIRBuilder(max_section_depth=args.max_section_depth)
 
     # 确定要处理的文档列表
@@ -156,7 +158,7 @@ def main():
             result = builder.build_from_pkl(data_path)
 
             # 保存 Outline 视图（用于审查）
-            outline_output_path = os.path.join(args.output_dir, f"outline_{doc_id}.xml")
+            outline_output_path = os.path.join(outline_dir, f"outline_{doc_id}.xml")
             outline_root = _build_outline_from_tree(result.root)
             ET.indent(outline_root, space="  ")
             outline_tree = ET.ElementTree(outline_root)
