@@ -6,6 +6,8 @@ MinerU 统一文件提取脚本 (step1_extract)
 
 import argparse
 import glob
+import hashlib
+import json
 import logging
 import os
 import time
@@ -76,8 +78,9 @@ class MinerUExtractor:
         output_dir = os.path.join(result_dir, "MinerU", sid)
         os.makedirs(output_dir, exist_ok=True)
 
-        # 检查本地是否已有结果
-        if os.path.exists(os.path.join(output_dir, "middle.json")):
+        # 检查本地是否已有结果（兼容 content_list/layout/middle）
+        if self._has_existing_outputs(output_dir):
+            self._canonicalize_outputs(output_dir)
             logger.info(f"[MinerU] 文档 {sid} 已处理过，跳过")
             return True
 
@@ -94,8 +97,98 @@ class MinerUExtractor:
         # 3. 下载结果
         success = self._download_and_extract(result_url, output_dir)
         if success:
+            self._canonicalize_outputs(output_dir)
             logger.info(f"[✓] 文档 {sid} 处理完成")
         return success
+
+    def _has_existing_outputs(self, output_dir: str) -> bool:
+        if os.path.exists(os.path.join(output_dir, "middle.json")):
+            return True
+        if os.path.exists(os.path.join(output_dir, "layout.json")):
+            return True
+        if os.path.exists(os.path.join(output_dir, "content_list.json")):
+            return True
+        for name in os.listdir(output_dir):
+            if name.endswith("_content_list.json"):
+                return True
+        return False
+
+    def _file_md5(self, path: str) -> str:
+        md5 = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                md5.update(chunk)
+        return md5.hexdigest()
+
+    def _canonicalize_outputs(self, output_dir: str) -> None:
+        """
+        将 MinerU 输出标准化，减少后续 step2 的不确定性：
+        1) 多个 *_content_list.json 时固定生成 content_list.json
+        2) model.json 回退到 middle.json
+        3) 产出 extract_manifest.json 记录源文件与 hash
+        """
+        manifest = {
+            "output_dir": output_dir,
+            "content_list_candidates": [],
+            "selected_content_list": "",
+            "selected_content_list_hash": "",
+            "layout_exists": os.path.exists(os.path.join(output_dir, "layout.json")),
+            "middle_exists": os.path.exists(os.path.join(output_dir, "middle.json")),
+        }
+
+        # 1) content_list 标准化
+        content_list_files = []
+        canonical_content = os.path.join(output_dir, "content_list.json")
+        if os.path.exists(canonical_content):
+            content_list_files.append(canonical_content)
+        for name in os.listdir(output_dir):
+            if name.endswith("_content_list.json"):
+                content_list_files.append(os.path.join(output_dir, name))
+
+        # 去重并按 mtime 降序，优先选择最新文件
+        content_list_files = sorted(
+            {os.path.abspath(p) for p in content_list_files},
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+
+        if content_list_files:
+            selected = content_list_files[0]
+            # 将选中文件复制为 canonical content_list.json（不删除原始文件）
+            if os.path.abspath(selected) != os.path.abspath(canonical_content):
+                shutil.copy2(selected, canonical_content)
+            selected_hash = self._file_md5(canonical_content)
+            manifest["selected_content_list"] = os.path.basename(selected)
+            manifest["selected_content_list_hash"] = selected_hash
+            for p in content_list_files:
+                try:
+                    manifest["content_list_candidates"].append(
+                        {
+                            "file": os.path.basename(p),
+                            "md5": self._file_md5(p),
+                            "mtime": int(os.path.getmtime(p)),
+                        }
+                    )
+                except Exception:
+                    manifest["content_list_candidates"].append(
+                        {"file": os.path.basename(p), "md5": "", "mtime": 0}
+                    )
+
+        # 2) middle.json 兼容回退
+        middle_path = os.path.join(output_dir, "middle.json")
+        model_path = os.path.join(output_dir, "model.json")
+        if (not os.path.exists(middle_path)) and os.path.exists(model_path):
+            shutil.copy2(model_path, middle_path)
+        manifest["middle_exists"] = os.path.exists(middle_path)
+
+        # 3) 写 manifest
+        try:
+            with open(
+                os.path.join(output_dir, "extract_manifest.json"), "w", encoding="utf-8"
+            ) as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"[MinerU] 写入 extract_manifest.json 失败: {e}")
 
     def _submit_task(self, file_path):
         """
@@ -242,7 +335,7 @@ class MinerUExtractor:
                     file_list.append(rel_path)
                     logger.info(f"   📄 发现文件: {rel_path}")
 
-            # 寻找 middle.json 文件
+            # 寻找解析结果文件（兼容新版 content_list）
             found_json = None
 
             for f in file_list:
@@ -252,20 +345,26 @@ class MinerUExtractor:
                 # 兼容其他可能的命名
                 if f.endswith("model.json"):
                     found_json = f
+                if f.endswith("_content_list.json"):
+                    found_json = f
 
             if found_json:
+                # 仅对 middle/model 做 middle.json 归一；content_list 保留原名，后续 canonicalize
                 src_path = os.path.join(output_dir, found_json)
-                dst_path = os.path.join(output_dir, "middle.json")
-
-                # 如果文件不在根目录，移动并重命名
-                if src_path != dst_path:
-                    if os.path.exists(dst_path):
-                        os.remove(dst_path)
-                    shutil.move(src_path, dst_path)
-                    logger.info(f"[✓] 已将 {found_json} 移动并重命名为 middle.json")
+                if found_json.endswith(("middle.json", "model.json")):
+                    dst_path = os.path.join(output_dir, "middle.json")
+                    if src_path != dst_path:
+                        if os.path.exists(dst_path):
+                            os.remove(dst_path)
+                        shutil.move(src_path, dst_path)
+                        logger.info(
+                            f"[✓] 已将 {found_json} 移动并重命名为 middle.json"
+                        )
                 return True
             else:
-                logger.warning("[!] 未找到 middle.json，请检查上方打印的文件列表")
+                logger.warning(
+                    "[!] 未找到 middle.json/model.json/content_list.json，请检查上方打印的文件列表"
+                )
                 return False
 
         except Exception as e:

@@ -628,7 +628,7 @@ class VisionAgent:
             references=references,
         )
 
-        print(f"[Figure Node] ✓ 图片 {img_id} 构建完成")
+        print(f"[Figure Node] [OK] 图片 {img_id} 构建完成")
         print(f"  → 章节: {figure_node.section_title}")
         print(f"  → 引用句数量: {len(references)}")
 
@@ -644,7 +644,7 @@ class VisionAgent:
         if not section_info:
             section_info = self.doc_reader.find_section_by_page(page_num)
         if not section_info:
-            print(f"[Table Node] ✗ 表格 {table_id}: 未找到所属章节 (页码: {page_num})")
+            print(f"[Table Node] [MISS] 表格 {table_id}: 未找到所属章节 (页码: {page_num})")
             return None
 
         references = self._extract_table_reference_sentences(
@@ -661,7 +661,7 @@ class VisionAgent:
             references=references,
         )
 
-        print(f"[Table Node] ✓ 表格 {table_id} 构建完成")
+        print(f"[Table Node] [OK] 表格 {table_id} 构建完成")
         print(f"  → 章节: {table_node.section_title}")
         print(f"  → 引用句数量: {len(references)}")
 
@@ -763,15 +763,34 @@ class VisionAgent:
     def _split_sentences(self, text: str) -> List[str]:
         if not text:
             return []
-        parts = re.split(r"([。！？.!?])", text)
-        sentences = []
-        for i in range(0, len(parts) - 1, 2):
-            sentence = (parts[i] + parts[i + 1]).strip()
-            if sentence:
-                sentences.append(sentence)
-        if len(parts) % 2 == 1 and parts[-1].strip():
-            sentences.append(parts[-1].strip())
-        return sentences
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return []
+        # 句号分句时避免切断章节编号/小数（如 5.3、4.2.1）
+        parts = re.split(r"(?<=[。！？!?])|(?<!\d)\.(?!\d)(?=\s|$)", normalized)
+        return [p.strip() for p in parts if p and p.strip()]
+
+    def _is_unusable_short_quote(self, text: str) -> bool:
+        if not text:
+            return True
+        s = text.strip()
+        if not s:
+            return True
+        if re.match(r"^(图片引用语义作用域如下|语义作用域如下)[:：]?$", s):
+            return True
+        return len(s) <= 10 and (
+            re.match(r"^[\d图圖图\.\s]+$", s) is not None
+            or s in ["图", "圖", "Figure", "Fig"]
+        )
+
+    def _pick_best_quote_candidate(self, candidates: List[str]) -> str:
+        cleaned = [str(c).strip() for c in candidates if c and str(c).strip()]
+        if not cleaned:
+            return ""
+        for c in cleaned:
+            if not self._is_unusable_short_quote(c):
+                return c
+        return cleaned[0]
 
     def _extract_scope_keywords(
         self, caption_text: str, image_capacity: ImageCapacity
@@ -1040,8 +1059,9 @@ class VisionAgent:
             raw_content = response.choices[0].message.content.strip()
             parsed = self._parse_json_from_response(raw_content)
             evidence_sentence = str(parsed.get("evidence_sentence", ""))
-            if not evidence_sentence and scope_text:
-                evidence_sentence = scope_text
+            evidence_sentence = self._pick_best_quote_candidate(
+                [evidence_sentence, scope_text] + [r.sentence for r in references]
+            )
             return RoleAssignment(
                 role=str(parsed.get("role", "UNKNOWN")),
                 confidence=float(parsed.get("confidence", 0.0)),
@@ -1114,13 +1134,10 @@ class VisionAgent:
     def _select_reference_sentence(
         self, figure_node: FigureNode, role_assignment: RoleAssignment
     ) -> str:
-        if role_assignment.evidence_sentence:
-            return role_assignment.evidence_sentence.strip()
-        if figure_node.image_scope_text:
-            return figure_node.image_scope_text.strip()
-        if figure_node.references:
-            return figure_node.references[0].sentence.strip()
-        return ""
+        return self._pick_best_quote_candidate(
+            [role_assignment.evidence_sentence, figure_node.image_scope_text]
+            + [r.sentence for r in figure_node.references]
+        )
 
     def _keyword_hits(self, text: str, keywords: List[str]) -> int:
         if not text:
@@ -1526,9 +1543,9 @@ class VisionAgent:
         media_kind: str,
     ) -> List[Dict[str, Any]]:
         issues: List[Dict[str, Any]] = []
+        evidence_sentence = (role_assignment.evidence_sentence or "").strip()
 
         if role_assignment.confidence < 0.6:
-            evidence_sentence = role_assignment.evidence_sentence or ""
             # 检测引用句是否过短（如只有"3."、"图3"等）
             is_quote_too_short = (
                 evidence_sentence
@@ -1557,6 +1574,11 @@ class VisionAgent:
                     "image_id": figure_node.figure_id,
                     "media_kind": media_kind,
                     "quote": evidence_sentence or "未能可靠识别图像论证角色",
+                    "diagnosis": "未能可靠识别图像论证角色",
+                    "evidence_quote": evidence_sentence,
+                    "evidence_status": (
+                        "verifiable" if evidence_sentence else "unverifiable"
+                    ),
                     "suggestion": suggestion,
                 }
             )
@@ -1569,6 +1591,7 @@ class VisionAgent:
             issues.append(generalization_issue)
 
         if stage_alignment.status == "mismatch":
+            diagnosis_msg = stage_alignment.message
             issues.append(
                 {
                     "issue_type": "图文一致性",
@@ -1577,12 +1600,18 @@ class VisionAgent:
                     "page": figure_node.page_num,
                     "image_id": figure_node.figure_id,
                     "media_kind": media_kind,
-                    "quote": stage_alignment.message,
+                    "quote": evidence_sentence or diagnosis_msg,
+                    "diagnosis": diagnosis_msg,
+                    "evidence_quote": evidence_sentence,
+                    "evidence_status": (
+                        "verifiable" if evidence_sentence else "unverifiable"
+                    ),
                     "suggestion": "请调整图片位置或修改引用语句，使论证阶段一致。示例：若图为结果曲线，请移至“实验结果/评测”小节并补充“如图3-11所示，本实验在不同置信度下的Precision变化”。",
                 }
             )
 
         if not image_capacity.sufficient:
+            diagnosis_msg = image_capacity.reason
             issues.append(
                 {
                     "issue_type": "图文一致性",
@@ -1591,7 +1620,12 @@ class VisionAgent:
                     "page": figure_node.page_num,
                     "image_id": figure_node.figure_id,
                     "media_kind": media_kind,
-                    "quote": image_capacity.reason,
+                    "quote": evidence_sentence or diagnosis_msg,
+                    "diagnosis": diagnosis_msg,
+                    "evidence_quote": evidence_sentence,
+                    "evidence_status": (
+                        "verifiable" if evidence_sentence else "unverifiable"
+                    ),
                     "suggestion": "请补充更能支撑该论证角色的图像信息或调整角色描述。示例：在图中增加图例/数值标注/对比曲线，或将正文表述从“验证模型性能显著优于基线”改为“展示Precision随置信度的变化趋势”。",
                 }
             )
@@ -1946,60 +1980,61 @@ class VisionAgent:
                     "adjacent_image_ids": adjacent_image_ids,
                 }
 
-        for elem in self.doc_reader.root.iter("CSV_Table"):
-            table_id = elem.get("table_id")
-            page_num = elem.get("page_num")
-            caption_text = ""
-            caption_pattern = re.compile(
-                r"^(table|tab\.?|表)\s*[\d\-\.]+", re.IGNORECASE
-            )
+        for tag in ("CSV_Table", "Table"):
+            for elem in self.doc_reader.root.iter(tag):
+                table_id = elem.get("table_id")
+                page_num = elem.get("page_num")
+                caption_text = ""
+                caption_pattern = re.compile(
+                    r"^(table|tab\.?|表)\s*[\d\-\.]+", re.IGNORECASE
+                )
 
-            for child in elem:
-                if child.tag == "Alt_Text" and child.text:
-                    caption_text = child.text
-                    break
-
-            # 【重要修复】只有在caption_text为空时才搜索周围文本，避免覆盖已有的Alt_Text
-            if not caption_text:
-                curr_elem = elem
-                for _ in range(2):
-                    parent = parent_map.get(curr_elem)
-                    if not parent:
+                for child in elem:
+                    if child.tag == "Alt_Text" and child.text:
+                        caption_text = child.text
                         break
-                    try:
-                        children = list(parent)
-                        idx = children.index(curr_elem)
-                        search_range = 5
-                        start_idx = max(0, idx - search_range)
-                        end_idx = min(len(children), idx + search_range + 1)
-                        for i in range(start_idx, end_idx):
-                            if i == idx and curr_elem == elem:
-                                continue
-                            node = children[i]
-                            text = "".join(node.itertext()).strip()
-                            if text:
-                                if self.doc_agent._is_header_footer(
-                                    text, node.get("page_num") or page_num
-                                ):
-                                    continue
-                                if caption_pattern.match(text):
-                                    caption_text = text
-                                    break
-                        if caption_text:
-                            break
-                    except ValueError:
-                        pass
-                    curr_elem = parent
 
-            if table_id:
-                section_info = self._find_section_by_element(elem, parent_map)
-                if not section_info:
-                    section_info = self.doc_reader.find_section_by_page(page_num)
-                table_info_map[table_id] = {
-                    "page_num": page_num,
-                    "caption": caption_text,
-                    "section_info": section_info,
-                }
+                # 只有在caption_text为空时才搜索周围文本，避免覆盖已有的Alt_Text
+                if not caption_text:
+                    curr_elem = elem
+                    for _ in range(2):
+                        parent = parent_map.get(curr_elem)
+                        if not parent:
+                            break
+                        try:
+                            children = list(parent)
+                            idx = children.index(curr_elem)
+                            search_range = 5
+                            start_idx = max(0, idx - search_range)
+                            end_idx = min(len(children), idx + search_range + 1)
+                            for i in range(start_idx, end_idx):
+                                if i == idx and curr_elem == elem:
+                                    continue
+                                node = children[i]
+                                text = "".join(node.itertext()).strip()
+                                if text:
+                                    if self.doc_agent._is_header_footer(
+                                        text, node.get("page_num") or page_num
+                                    ):
+                                        continue
+                                    if caption_pattern.match(text):
+                                        caption_text = text
+                                        break
+                            if caption_text:
+                                break
+                        except ValueError:
+                            pass
+                        curr_elem = parent
+
+                if table_id:
+                    section_info = self._find_section_by_element(elem, parent_map)
+                    if not section_info:
+                        section_info = self.doc_reader.find_section_by_page(page_num)
+                    table_info_map[table_id] = {
+                        "page_num": page_num,
+                        "caption": caption_text,
+                        "section_info": section_info,
+                    }
 
         # 审查起点与 NormativeAgent、LogicAgent 对齐：摘要之前的章节内图片不审查
         section_order: Dict[int, int] = {}
@@ -2278,7 +2313,7 @@ class VisionAgent:
                 )
                 count += 1
 
-        print(f"\n[Agent] ✅ 完成 {count} 张图片的ARG一致性分析")
+        print(f"\n[Agent] [OK] 完成 {count} 张图片的ARG一致性分析")
         print(
             "  → 发现问题: 共 "
             f"{sum(len(r.get('issues', [])) for r in results if isinstance(r, dict))} 个图文一致性问题"

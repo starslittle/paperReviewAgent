@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from dotenv import load_dotenv
 import re
+from collections import defaultdict
 
 # 加载环境变量
 load_dotenv(override=True, encoding="utf-8")
@@ -23,13 +24,33 @@ class ImprovedJsonProcessor:
 
     def __init__(self):
         self.heading_pattern = re.compile(r"^(\d+\.|\d+\.\d+\.|第.+章)")
+        self.last_source_json_path = ""
+        self.last_source_json_type = ""
+        self.last_quality_report: Dict = {}
 
     def _normalize_header_text(self, text: str) -> str:
         return " ".join(str(text).strip().split())
 
+    def _pick_best_caption(self, caption_obj) -> Optional[str]:
+        if caption_obj is None:
+            return None
+        if isinstance(caption_obj, str):
+            cleaned = caption_obj.strip()
+            return cleaned or None
+        if isinstance(caption_obj, list):
+            cands = [str(x).strip() for x in caption_obj if str(x).strip()]
+            if not cands:
+                return None
+            # 优先非“续表”标题，降低弱标题噪声
+            non_cont = [x for x in cands if "续表" not in x]
+            if non_cont:
+                return max(non_cont, key=len)
+            return max(cands, key=len)
+        return None
+
     def _extract_table_data(
         self, element: dict
-    ) -> Tuple[str, Optional[str], Optional[str]]:
+    ) -> Tuple[str, Optional[str], Optional[str], Optional[List[str]]]:
         """
         简化版：优先读顶层字段，兼容嵌套 blocks
         - content_list.json：直接有 table_body / img_path / table_caption
@@ -40,15 +61,17 @@ class ImprovedJsonProcessor:
         image_path = element.get("img_path") or element.get("image_path")
 
         # 2. Caption：直接用 table_caption（MinerU 真源）
-        caption = element.get("table_caption")
-        if isinstance(caption, list):
-            caption = caption[0] if caption else None
-        if isinstance(caption, str):
-            caption = caption.strip() or None
+        caption_raw = element.get("table_caption")
+        caption = self._pick_best_caption(caption_raw)
 
         # 3. 如果顶层有数据，直接返回
         if content or image_path:
-            return (content or "", caption, image_path)
+            return (
+                content or "",
+                caption,
+                image_path,
+                caption_raw if isinstance(caption_raw, list) else None,
+            )
 
         # 4. 兼容 layout.json：从嵌套 blocks 提取
         for block in element.get("blocks") or []:
@@ -72,39 +95,82 @@ class ImprovedJsonProcessor:
                 if content or image_path:
                     break
 
-        return (content or "", caption, image_path)
+        return (
+            content or "",
+            caption,
+            image_path,
+            caption_raw if isinstance(caption_raw, list) else None,
+        )
+
+    def _select_source_json(self, root_path: str) -> Tuple[Optional[str], str]:
+        """
+        稳定选择数据源，避免多个 *_content_list.json 带来的非确定性：
+        优先级：content_list.json > 最新 *_content_list.json > middle.json > layout.json
+        """
+        canonical_content = os.path.join(root_path, "content_list.json")
+        if os.path.exists(canonical_content):
+            return canonical_content, "content_list_canonical"
+
+        content_list_candidates = [
+            os.path.join(root_path, f)
+            for f in os.listdir(root_path)
+            if f.endswith("_content_list.json")
+        ]
+        if content_list_candidates:
+            content_list_candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            selected = content_list_candidates[0]
+            if len(content_list_candidates) > 1:
+                print(
+                    f"[Warning] 检测到多个 *_content_list.json，使用最新文件: {os.path.basename(selected)}"
+                )
+            return selected, "content_list"
+
+        middle_json_path = os.path.join(root_path, "middle.json")
+        if os.path.exists(middle_json_path):
+            return middle_json_path, "middle"
+
+        layout_json_path = os.path.join(root_path, "layout.json")
+        if os.path.exists(layout_json_path):
+            return layout_json_path, "layout"
+
+        return None, "none"
+
+    def _safe_bbox(self, raw_bbox) -> Optional[List[float]]:
+        if not raw_bbox or not isinstance(raw_bbox, list) or len(raw_bbox) < 4:
+            return None
+        try:
+            return [float(raw_bbox[0]), float(raw_bbox[1]), float(raw_bbox[2]), float(raw_bbox[3])]
+        except Exception:
+            return None
+
+    def _estimate_page_heights(self, elements: List[dict]) -> Dict[int, float]:
+        page_heights: Dict[int, float] = {}
+        for elem in elements:
+            if not isinstance(elem, dict):
+                continue
+            page_idx = int(elem.get("page_idx", 0) or 0)
+            bbox = self._safe_bbox(elem.get("bbox"))
+            if not bbox:
+                continue
+            page_heights[page_idx] = max(page_heights.get(page_idx, 0.0), bbox[3])
+        # 给没检测到 bbox 的页一个合理兜底
+        for elem in elements:
+            page_idx = int(elem.get("page_idx", 0) or 0)
+            if page_idx not in page_heights:
+                page_heights[page_idx] = 1000.0
+        return page_heights
 
     def process(self, root_path):
         """
         处理 MinerU 产物,生成带正确标题层级的 DataFrame
         """
-        # 优先级：content_list.json > middle.json > layout.json
-        content_list_path = None
-        middle_json_path = None
-
-        # 查找 content_list.json
-        for f in os.listdir(root_path):
-            if f.endswith("_content_list.json"):
-                content_list_path = os.path.join(root_path, f)
-                break
-
-        # 查找 middle.json
-        middle_json_path = os.path.join(root_path, "middle.json")
-        layout_json_path = os.path.join(root_path, "layout.json")
-
-        # 确定使用的文件
-        if content_list_path and os.path.exists(content_list_path):
-            json_path = content_list_path
-            print(f"[Info] Using content_list.json: {os.path.basename(json_path)}")
-        elif middle_json_path and os.path.exists(middle_json_path):
-            json_path = middle_json_path
-            print(f"[Info] Using middle.json")
-        elif layout_json_path and os.path.exists(layout_json_path):
-            json_path = layout_json_path
-            print(f"[Info] Using layout.json")
-        else:
+        json_path, source_type = self._select_source_json(root_path)
+        if not json_path:
             print(f"[Error] 未找到任何可用的解析 JSON")
             return None
+        self.last_source_json_path = json_path
+        self.last_source_json_type = source_type
+        print(f"[Info] Using {source_type}: {os.path.basename(json_path)}")
 
         try:
             with open(json_path, "r", encoding="utf-8") as f:
@@ -135,6 +201,19 @@ class ImprovedJsonProcessor:
         if not elements:
             print(f"[Warning] JSON 中未找到有效数据")
             return None
+
+        page_heights = self._estimate_page_heights(elements)
+        discarded_text_pages = defaultdict(set)
+        for elem in elements:
+            if not isinstance(elem, dict):
+                continue
+            if (elem.get("type", "") or "").lower() != "discarded":
+                continue
+            text = self._normalize_header_text(elem.get("content") or elem.get("text") or "")
+            if not text:
+                continue
+            page_idx = int(elem.get("page_idx", 0) or 0)
+            discarded_text_pages[text].add(page_idx)
 
         # 构建 DataFrame
         records = []
@@ -172,24 +251,32 @@ class ImprovedJsonProcessor:
                 continue
 
             if etype == "discarded":
-                # 区分页眉和页脚：根据 bbox 的 y 坐标判断位置
-                bbox = element.get("bbox")
-                if bbox and len(bbox) >= 4:
-                    # bbox[1] 是 y0（顶部坐标），值越小越靠近页面顶部
-                    # 简单判断：如果在页面上半部分，认为是页眉，否则是页脚
-                    # 可以根据实际情况调整阈值
-                    page_height = 842  # A4 纸的默认高度（pt），可以从 page_size 获取
-                    y_position = bbox[1]
+                bbox = self._safe_bbox(element.get("bbox"))
+                text_norm = self._normalize_header_text(
+                    element.get("content") or element.get("text") or ""
+                )
+                repeat_pages = len(discarded_text_pages.get(text_norm, set()))
+                page_height = page_heights.get(page_idx, 1000.0)
+                top_ratio = None
+                bottom_ratio = None
+                if bbox:
+                    top_ratio = bbox[1] / max(page_height, 1.0)
+                    bottom_ratio = bbox[3] / max(page_height, 1.0)
 
-                    if y_position < page_height * 0.15:  # 上方 15%
-                        style, item_id = "Header", None
-                    elif y_position > page_height * 0.85:  # 下方 15%
-                        style, item_id = "Footer", None
-                    else:
-                        # 中间区域的 discarded，可能是误判，仍标记为 Discarded
-                        style, item_id = "Discarded", None
+                is_page_no = bool(
+                    re.fullmatch(r"[-\s]*\d+[-\s]*", text_norm)
+                    or re.fullmatch(r"第\s*\d+\s*页", text_norm)
+                )
+
+                # 仅在“跨页重复”或“页码样式明显”时判定为页眉页脚，降低误判
+                if repeat_pages >= 3 and top_ratio is not None and top_ratio <= 0.20:
+                    style, item_id = "Header", None
+                elif (
+                    (repeat_pages >= 3 and bottom_ratio is not None and bottom_ratio >= 0.80)
+                    or (is_page_no and bottom_ratio is not None and bottom_ratio >= 0.75)
+                ):
+                    style, item_id = "Footer", None
                 else:
-                    # 没有 bbox 信息，默认标记为 Discarded
                     style, item_id = "Discarded", None
             else:
                 # 判定样式
@@ -209,14 +296,19 @@ class ImprovedJsonProcessor:
                 content = item_id
             elif style == "Table":
                 # 提取表格数据（优先用顶层字段）
-                table_content, table_caption, table_img_path = self._extract_table_data(
-                    element
-                )
+                (
+                    table_content,
+                    table_caption,
+                    table_img_path,
+                    table_caption_raw,
+                ) = self._extract_table_data(element)
                 if not table_content and isinstance(content, str):
                     table_content = content
 
                 # 构建统一结构（与 Image 对齐）
                 content = {"content": table_content or "", "alt_text": table_caption}
+                if table_caption_raw:
+                    content["alt_text_raw"] = table_caption_raw
                 # 表格图统一用 figures/ 前缀
                 if table_img_path:
                     content["image_path"] = "figures/" + os.path.basename(
@@ -333,6 +425,106 @@ class ImprovedJsonProcessor:
                 f"    Font size range: {font_df['font_size'].min():.1f} - {font_df['font_size'].max():.1f}"
             )
 
+    def build_quality_report(self, df: pd.DataFrame) -> Dict:
+        """
+        预处理质量报告（用于观察预处理误诊风险）
+        """
+        report: Dict = {
+            "source_json_path": self.last_source_json_path,
+            "source_json_type": self.last_source_json_type,
+            "total_rows": int(len(df)),
+            "style_distribution": {
+                str(k): int(v) for k, v in df["style"].value_counts().to_dict().items()
+            },
+        }
+
+        headers = df[df["style"] == "Header"].copy()
+        footers = df[df["style"] == "Footer"].copy()
+        tables = df[df["style"] == "Table"].copy()
+        headings = df[df["style"].astype(str).str.startswith("Heading", na=False)].copy()
+
+        for frame in (headers, footers):
+            if not frame.empty:
+                frame["text_norm"] = (
+                    frame["para_text"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+                )
+
+        header_unique = (
+            headers["text_norm"].nunique() if not headers.empty and "text_norm" in headers else 0
+        )
+        footer_unique = (
+            footers["text_norm"].nunique() if not footers.empty and "text_norm" in footers else 0
+        )
+        header_singletons = 0
+        footer_singletons = 0
+        if not headers.empty and "text_norm" in headers:
+            header_singletons = int((headers["text_norm"].value_counts() == 1).sum())
+        if not footers.empty and "text_norm" in footers:
+            footer_singletons = int((footers["text_norm"].value_counts() == 1).sum())
+
+        report["header_footer_quality"] = {
+            "header_count": int(len(headers)),
+            "footer_count": int(len(footers)),
+            "header_unique_count": int(header_unique),
+            "footer_unique_count": int(footer_unique),
+            "header_singleton_count": int(header_singletons),
+            "footer_singleton_count": int(footer_singletons),
+            "header_singleton_rate": round(
+                header_singletons / max(len(headers), 1), 4
+            ),
+            "footer_singleton_rate": round(
+                footer_singletons / max(len(footers), 1), 4
+            ),
+        }
+
+        table_with_caption = 0
+        if not tables.empty:
+            for v in tables["para_text"].tolist():
+                if isinstance(v, dict) and str(v.get("alt_text", "")).strip():
+                    table_with_caption += 1
+        report["table_caption_quality"] = {
+            "table_count": int(len(tables)),
+            "table_with_caption_count": int(table_with_caption),
+            "table_caption_coverage": round(
+                table_with_caption / max(len(tables), 1), 4
+            ),
+        }
+
+        toc_like_heading = 0
+        if not headings.empty:
+            for t in headings["para_text"].astype(str).tolist():
+                if re.search(r"(\.{2,}|…{2,}|·{2,})", t):
+                    toc_like_heading += 1
+        report["heading_quality"] = {
+            "heading_count": int(len(headings)),
+            "toc_like_heading_count": int(toc_like_heading),
+            "toc_like_heading_rate": round(toc_like_heading / max(len(headings), 1), 4),
+        }
+
+        suspicious_pattern = r"</?Section|</?Paragraph|</?Heading|\$\s*\\|end-toend|\.3\s+研究内容"
+        suspicious_rows = df[
+            df["para_text"].astype(str).str.contains(suspicious_pattern, regex=True, na=False)
+        ]
+        report["noise_quality"] = {
+            "suspicious_row_count": int(len(suspicious_rows)),
+            "suspicious_row_rate": round(len(suspicious_rows) / max(len(df), 1), 4),
+        }
+
+        # 预处理误诊风险代理分：加权汇总（用于横向比较同一文档多次处理）
+        proxy_score = (
+            report["header_footer_quality"]["header_singleton_rate"] * 0.30
+            + report["heading_quality"]["toc_like_heading_rate"] * 0.35
+            + (1.0 - report["table_caption_quality"]["table_caption_coverage"]) * 0.20
+            + report["noise_quality"]["suspicious_row_rate"] * 0.15
+        )
+        report["preprocess_misdiagnosis_proxy"] = {
+            "risk_score": round(float(proxy_score), 4),
+            "score_range": "0~1（越低越好）",
+        }
+
+        self.last_quality_report = report
+        return report
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -391,6 +583,12 @@ def main():
             os.path.join(save_path, "data.csv"), index=False, encoding="utf-8-sig"
         )
 
+        # 生成预处理质量报告（用于观察误诊风险）
+        quality_report = processor.build_quality_report(df)
+        quality_report_path = os.path.join(save_path, "quality_report.json")
+        with open(quality_report_path, "w", encoding="utf-8") as f:
+            json.dump(quality_report, f, ensure_ascii=False, indent=2)
+
         # 复制图片到 figures 目录，供后续 DocReader 读取
         src_images_dir = os.path.join(root_path, "images")
         dst_figures_dir = os.path.join(save_path, "figures")
@@ -416,6 +614,9 @@ def main():
         print(f"[OK] {sid} processed -> {save_path}/")
         print(f"    - data.pkl (updated with correct headings)")
         print(f"    - data.csv (for debugging)")
+        print(
+            f"    - quality_report.json (misdiagnosis proxy={quality_report.get('preprocess_misdiagnosis_proxy', {}).get('risk_score', 'N/A')})"
+        )
 
     print(f"\n[OK] All processing completed")
 

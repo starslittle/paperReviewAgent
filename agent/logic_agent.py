@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import zipfile
 import xml.etree.ElementTree as ET
+from html import unescape
 from typing import Any, Dict, List
 
 from openai import OpenAI
@@ -383,7 +386,7 @@ class LogicAgent:
         # 如果置信度高，直接返回
         if confidence >= 0.7:
             print(
-                f"[Type Detection] ✓ 置信度足够，确定为: {'程序开发类' if thesis_type == 'system' else '算法理论类'}"
+                f"[Type Detection] [OK] 置信度足够，确定为: {'程序开发类' if thesis_type == 'system' else '算法理论类'}"
             )
             print("=" * 60 + "\n")
             return thesis_type
@@ -394,12 +397,12 @@ class LogicAgent:
 
         if confidence < 0.6:
             print(
-                f"[Type Detection] ⚠️ 警告：置信度较低 ({confidence:.2f})，建议人工确认"
+                f"[Type Detection] [WARN] 置信度较低 ({confidence:.2f})，建议人工确认"
             )
             print(f"[Type Detection] 可使用 --thesis-type 参数手动指定类型")
         else:
             print(
-                f"[Type Detection] ✓ 深度判断完成，确定为: {'程序开发类' if thesis_type == 'system' else '算法理论类'}"
+                f"[Type Detection] [OK] 深度判断完成，确定为: {'程序开发类' if thesis_type == 'system' else '算法理论类'}"
             )
 
         print("=" * 60 + "\n")
@@ -670,20 +673,54 @@ class LogicAgent:
                     max_val = max(values)
                     min_val = min(values)
                     if max_val > 0 and (max_val - min_val) / max_val > 0.05:
+                        evidence_list = []
+                        for occ in occurrences[:5]:
+                            evidence_list.append(
+                                {
+                                    "source": occ.get("source"),
+                                    "value": occ.get("value"),
+                                    "unit": occ.get("unit", ""),
+                                    "page": occ.get("page"),
+                                    "context": occ.get("context", ""),
+                                }
+                            )
+
+                        evidence_quote = ""
+                        for ev in evidence_list:
+                            if ev.get("context"):
+                                evidence_quote = str(ev.get("context", "")).strip()
+                                break
+                        if not evidence_quote and evidence_list:
+                            ev0 = evidence_list[0]
+                            evidence_quote = (
+                                f"{ev0.get('source', '未知来源')} "
+                                f"{ev0.get('value', '')}{ev0.get('unit', '')}"
+                            ).strip()
+
                         conflicts.append(
                             {
                                 "issue_type": "逻辑性-数值冲突",
                                 "severity": "High",
                                 "section": "跨章节",
-                                "page": occurrences[0]["page"],
-                                "quote": f"'{metric_key}' 在不同位置有不同的数值",
+                                "page": evidence_list[0].get("page")
+                                if evidence_list
+                                else occurrences[0].get("page"),
+                                # 兼容旧展示/下游：quote 仍保留，但优先使用可追溯证据
+                                "quote": evidence_quote
+                                or f"'{metric_key}' 在不同位置有不同的数值",
+                                "diagnosis": f"'{metric_key}' 在不同位置有不同的数值",
+                                "evidence_quote": evidence_quote,
+                                "evidence_status": (
+                                    "verifiable" if evidence_quote else "unverifiable"
+                                ),
+                                "evidence_list": evidence_list,
                                 "suggestion": (
                                     f"'{metric_key}' 的数值在文档中不一致（范围：{min_val}-{max_val}）。"
                                     f"出现位置："
                                     + "; ".join(
                                         [
-                                            f"{occ['source']}为{occ['value']}{occ.get('unit', '')}"
-                                            for occ in occurrences[:3]
+                                            f"{occ.get('source', '未知来源')}为{occ.get('value', '')}{occ.get('unit', '')}"
+                                            for occ in evidence_list[:3]
                                         ]
                                     )
                                 ),
@@ -692,6 +729,485 @@ class LogicAgent:
 
         print(f"[Fact Conflict Detection] Found {len(conflicts)} conflicts")
         return conflicts
+
+    def _xml_to_plain_text(self, xml_text: str, max_chars: int = 24000) -> str:
+        if not isinstance(xml_text, str) or not xml_text.strip():
+            return ""
+        text = re.sub(r"<[^>]+>", " ", xml_text)
+        text = unescape(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+
+    def _is_background_section(self, title: str) -> bool:
+        t = str(title or "").lower()
+        return any(
+            k in t
+            for k in [
+                "目录",
+                "参考文献",
+                "致谢",
+                "摘要",
+                "abstract",
+                "研究现状",
+                "国内外",
+                "相关研究",
+                "相关工作",
+                "绪论",
+                "引言",
+            ]
+        )
+
+    def _is_project_scope_context(self, section_title: str, context: str) -> bool:
+        ctx = str(context or "")
+        title = str(section_title or "")
+        strong_positive = [
+            "本系统",
+            "本论文",
+            "系统采用",
+            "系统使用",
+            "前端采用",
+            "后端采用",
+            "采用",
+            "使用",
+            "基于",
+            "实现",
+        ]
+        negative_hint = [
+            "现有系统",
+            "已有系统",
+            "他人研究",
+            "文献",
+            "例如",
+            "如",
+            "国外",
+            "国内",
+            "相关研究",
+            "相关工作",
+        ]
+        has_positive = any(k in ctx for k in strong_positive) or any(
+            k in title for k in ["系统设计", "系统实现", "需求", "测试", "结论"]
+        )
+        has_negative = any(k in ctx for k in negative_hint) or self._is_background_section(
+            section_title
+        )
+        return bool(has_positive and not has_negative)
+
+    def _iter_pattern_contexts(
+        self, text: str, pattern: str, flags: int = re.IGNORECASE, window: int = 44
+    ):
+        for m in re.finditer(pattern, text, flags):
+            s = max(0, m.start() - window)
+            e = min(len(text), m.end() + window)
+            context = text[s:e].strip()
+            yield m, context
+
+    def _to_ms(self, value: float, unit: str) -> float:
+        u = str(unit or "").lower()
+        if u in {"s", "sec", "second", "seconds", "秒"}:
+            return float(value) * 1000.0
+        return float(value)
+
+    def _verify_consistency_candidate_with_llm(
+        self, candidate: Dict[str, Any]
+    ) -> tuple[bool | None, str]:
+        """
+        规则触发后再做 LLM 复核，降低误报。
+        返回:
+          - True: 确认冲突
+          - False: 复核为非冲突
+          - None: 无法复核（网络/余额等），按低置信待复核处理
+        """
+        try:
+            prompt = """
+你是毕业论文一致性审查复核助手。请判断“规则触发的候选冲突”是否成立。
+
+判定原则：
+1) 仅当同一“项目范围”内存在不可兼容陈述时，判定冲突。
+2) 若是背景综述/他人研究/举例，不算项目冲突。
+3) 若上下文可解释为不同阶段、迁移计划或非同一对象，不算冲突。
+4) 输出必须是 JSON，格式：
+{"is_conflict": true/false, "reason": "..."}
+"""
+            payload = {
+                "type": candidate.get("type"),
+                "diagnosis": candidate.get("diagnosis"),
+                "evidence_list": candidate.get("evidence_list", [])[:6],
+            }
+            messages = [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ]
+            response = self.doc_agent._call_llm(messages, max_tokens=700, temperature=0.0)
+            raw = response.choices[0].message.content
+            data = self.doc_agent._parse_json(raw)
+            if isinstance(data, dict) and "is_conflict" in data:
+                return bool(data.get("is_conflict")), str(data.get("reason", "") or "")
+            return None, "LLM 复核返回格式异常"
+        except Exception as e:
+            error_text = str(e)
+            if "Insufficient Balance" in error_text or "402" in error_text:
+                print("[Consistency Verification] Skipped (insufficient balance)")
+                return None, "LLM 余额不足，未完成复核"
+            print(f"[Consistency Verification] Failed: {e}")
+            return None, f"LLM 复核失败: {e}"
+
+    def _collect_consistency_mentions(self, chapters: List[Dict[str, Any]]) -> Dict[str, Any]:
+        tech_mentions: List[Dict[str, Any]] = []
+        security_mentions: List[Dict[str, Any]] = []
+        perf_mentions: List[Dict[str, Any]] = []
+
+        for chap in chapters:
+            title = str(chap.get("title", "") or "")
+            if not title:
+                continue
+            if any(x in title for x in ["目录", "参考文献", "致谢", "诚信承诺"]):
+                continue
+            page = chap.get("start_page_num")
+            text = self._xml_to_plain_text(str(chap.get("content_xml", "") or ""))
+            if not text:
+                continue
+
+            # === 技术栈版本 ===
+            vue_patterns = [
+                r"\bvue\s*([23])(?:\.\d+){0,2}\b",
+                r"\bvue([23])\b",
+            ]
+            for vp in vue_patterns:
+                for m, ctx in self._iter_pattern_contexts(text, vp):
+                    major = m.group(1) if m.lastindex else None
+                    if not major:
+                        continue
+                    tech_mentions.append(
+                        {
+                            "component": "vue",
+                            "value": f"v{major}",
+                            "context": ctx,
+                            "source": title,
+                            "page": page,
+                            "project_scope": self._is_project_scope_context(title, ctx),
+                        }
+                    )
+
+            for m, ctx in self._iter_pattern_contexts(text, r"element\s*ui"):
+                tech_mentions.append(
+                    {
+                        "component": "ui_lib",
+                        "value": "element-ui",
+                        "context": ctx,
+                        "source": title,
+                        "page": page,
+                        "project_scope": self._is_project_scope_context(title, ctx),
+                    }
+                )
+            for m, ctx in self._iter_pattern_contexts(text, r"element\s*plus"):
+                tech_mentions.append(
+                    {
+                        "component": "ui_lib",
+                        "value": "element-plus",
+                        "context": ctx,
+                        "source": title,
+                        "page": page,
+                        "project_scope": self._is_project_scope_context(title, ctx),
+                    }
+                )
+
+            for m, ctx in self._iter_pattern_contexts(
+                text, r"spring\s*boot\s*([123])(?:\.\d+){0,2}"
+            ):
+                major = m.group(1)
+                tech_mentions.append(
+                    {
+                        "component": "spring_boot",
+                        "value": f"v{major}",
+                        "context": ctx,
+                        "source": title,
+                        "page": page,
+                        "project_scope": self._is_project_scope_context(title, ctx),
+                    }
+                )
+
+            # === 安全方案（密码相关）===
+            for m, ctx in self._iter_pattern_contexts(
+                text, r"\b(bcrypt|md5|sha-?1|sha-?256|argon2|pbkdf2)\b"
+            ):
+                algo = m.group(1).lower().replace("-", "")
+                if not any(k in ctx for k in ["密码", "口令", "加密", "哈希", "鉴权", "存储"]):
+                    continue
+                # 否定句不参与“采用冲突”判定
+                left_ctx = ctx[: max(0, ctx.lower().find(m.group(1).lower()))]
+                negated = bool(re.search(r"(不|避免|弃用|禁止|不使用|不再使用)$", left_ctx[-8:]))
+                security_mentions.append(
+                    {
+                        "algo": algo,
+                        "context": ctx,
+                        "source": title,
+                        "page": page,
+                        "project_scope": self._is_project_scope_context(title, ctx),
+                        "negated": negated,
+                    }
+                )
+
+            # === 性能承诺/测试证据 ===
+            is_test_chapter = any(k in title for k in ["测试", "实验", "评估"])
+
+            for m, ctx in self._iter_pattern_contexts(
+                text, r"(?:并发(?:用户)?|用户并发)\D{0,8}(\d{2,6})|(\d{2,6})\s*并发(?:用户)?"
+            ):
+                val = None
+                if m.lastindex:
+                    for gi in range(1, m.lastindex + 1):
+                        if m.group(gi) and str(m.group(gi)).isdigit():
+                            val = int(m.group(gi))
+                            break
+                if val is None:
+                    continue
+                mode = "test" if is_test_chapter or any(k in ctx for k in ["测试", "压测", "JMeter", "结果"]) else "promise"
+                perf_mentions.append(
+                    {
+                        "metric": "concurrency",
+                        "value": float(val),
+                        "unit": "users",
+                        "mode": mode,
+                        "context": ctx,
+                        "source": title,
+                        "page": page,
+                        "project_scope": self._is_project_scope_context(title, ctx),
+                    }
+                )
+
+            for m, ctx in self._iter_pattern_contexts(
+                text,
+                r"(?:响应时间|时延|延迟|耗时)\D{0,10}([0-9]+(?:\.[0-9]+)?)\s*(ms|毫秒|s|秒)",
+            ):
+                val = float(m.group(1))
+                unit = m.group(2)
+                mode = "test" if is_test_chapter or any(k in ctx for k in ["测试", "压测", "JMeter", "结果", "平均"]) else "promise"
+                perf_mentions.append(
+                    {
+                        "metric": "latency",
+                        "value": self._to_ms(val, unit),
+                        "unit": "ms",
+                        "mode": mode,
+                        "context": ctx,
+                        "source": title,
+                        "page": page,
+                        "project_scope": self._is_project_scope_context(title, ctx),
+                    }
+                )
+
+        return {
+            "tech_mentions": tech_mentions,
+            "security_mentions": security_mentions,
+            "perf_mentions": perf_mentions,
+        }
+
+    def _build_consistency_issue_from_candidate(
+        self, candidate: Dict[str, Any], verify_result: tuple[bool | None, str]
+    ) -> Dict[str, Any] | None:
+        verdict, verify_reason = verify_result
+        if verdict is False:
+            return None
+
+        evidence_list = candidate.get("evidence_list", [])[:6]
+        evidence_quote = ""
+        for ev in evidence_list:
+            if ev.get("context"):
+                evidence_quote = str(ev.get("context", "")).strip()
+                break
+        page = evidence_list[0].get("page") if evidence_list else None
+
+        if verdict is None:
+            severity = "Low"
+            evidence_status = "synthetic"
+            suggestion = (
+                candidate.get("suggestion", "")
+                + "（规则已触发，但 LLM 复核未完成，建议人工复核后再下结论）"
+            )
+            diagnosis = candidate.get("diagnosis", "") + "（待复核）"
+        else:
+            severity = candidate.get("severity", "Medium")
+            evidence_status = "verifiable" if evidence_quote else "unverifiable"
+            suggestion = candidate.get("suggestion", "")
+            diagnosis = candidate.get("diagnosis", "")
+
+        if verify_reason:
+            diagnosis = f"{diagnosis} 复核说明：{verify_reason}".strip()
+
+        return {
+            "issue_type": "逻辑性-跨章节一致性",
+            "severity": severity,
+            "section": "跨章节一致性",
+            "page": page,
+            "quote": evidence_quote or candidate.get("diagnosis", ""),
+            "diagnosis": diagnosis,
+            "evidence_quote": evidence_quote,
+            "evidence_status": evidence_status,
+            "evidence_mode": "rule_plus_llm",
+            "consistency_category": candidate.get("type", ""),
+            "evidence_list": evidence_list,
+            "suggestion": suggestion,
+        }
+
+    def _detect_targeted_consistency_conflicts(
+        self, chapters: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        跨章节一致性专项检查（窄而准）：
+        1) 技术栈版本冲突
+        2) 安全方案冲突（密码加密）
+        3) 性能承诺 vs 测试证据
+        """
+        print("[Consistency] Running targeted cross-chapter consistency checks...")
+        signals = self._collect_consistency_mentions(chapters)
+        tech_mentions = [m for m in signals["tech_mentions"] if m.get("project_scope")]
+        security_mentions = [
+            m
+            for m in signals["security_mentions"]
+            if m.get("project_scope") and not m.get("negated")
+        ]
+        perf_mentions = [m for m in signals["perf_mentions"] if m.get("project_scope")]
+
+        candidates: List[Dict[str, Any]] = []
+
+        # === 1) 技术栈版本冲突 ===
+        vue_vers = sorted({m["value"] for m in tech_mentions if m.get("component") == "vue"})
+        if len(vue_vers) > 1:
+            ev = [m for m in tech_mentions if m.get("component") == "vue"][:6]
+            candidates.append(
+                {
+                    "type": "tech_stack_version_conflict",
+                    "severity": "High",
+                    "diagnosis": f"前端框架 Vue 版本前后不一致：{', '.join(vue_vers)}",
+                    "suggestion": "统一 Vue 主版本并同步核对相关依赖（如路由、状态管理、UI 组件库）。",
+                    "evidence_list": ev,
+                }
+            )
+
+        has_vue3 = any(m.get("component") == "vue" and m.get("value") == "v3" for m in tech_mentions)
+        has_vue2 = any(m.get("component") == "vue" and m.get("value") == "v2" for m in tech_mentions)
+        has_element_ui = any(
+            m.get("component") == "ui_lib" and m.get("value") == "element-ui"
+            for m in tech_mentions
+        )
+        has_element_plus = any(
+            m.get("component") == "ui_lib" and m.get("value") == "element-plus"
+            for m in tech_mentions
+        )
+        if has_vue3 and has_element_ui:
+            ev = [
+                m
+                for m in tech_mentions
+                if (m.get("component") == "vue" and m.get("value") == "v3")
+                or (m.get("component") == "ui_lib" and m.get("value") == "element-ui")
+            ][:6]
+            candidates.append(
+                {
+                    "type": "tech_stack_compatibility_conflict",
+                    "severity": "High",
+                    "diagnosis": "检测到 Vue3 与 Element UI 并存，存在技术栈兼容性风险。",
+                    "suggestion": "若使用 Vue3，建议统一改为 Element Plus；若保留 Element UI，建议统一为 Vue2。",
+                    "evidence_list": ev,
+                }
+            )
+        if has_vue2 and has_element_plus:
+            ev = [
+                m
+                for m in tech_mentions
+                if (m.get("component") == "vue" and m.get("value") == "v2")
+                or (m.get("component") == "ui_lib" and m.get("value") == "element-plus")
+            ][:6]
+            candidates.append(
+                {
+                    "type": "tech_stack_compatibility_conflict",
+                    "severity": "High",
+                    "diagnosis": "检测到 Vue2 与 Element Plus 并存，存在技术栈兼容性风险。",
+                    "suggestion": "若使用 Vue2，建议统一为 Element UI；若使用 Element Plus，建议统一升级到 Vue3。",
+                    "evidence_list": ev,
+                }
+            )
+
+        # === 2) 安全方案冲突（密码加密）===
+        algos = sorted({m["algo"] for m in security_mentions})
+        if len(algos) > 1:
+            ev = security_mentions[:6]
+            candidates.append(
+                {
+                    "type": "security_scheme_conflict",
+                    "severity": "High",
+                    "diagnosis": f"密码安全方案前后不一致：{', '.join(algos)} 并存。",
+                    "suggestion": "统一密码存储方案并在设计/实现/测试章节保持一致，避免出现多种不兼容算法描述。",
+                    "evidence_list": ev,
+                }
+            )
+
+        # === 3) 性能承诺 vs 测试证据 ===
+        promise_conc = [m for m in perf_mentions if m["metric"] == "concurrency" and m["mode"] == "promise"]
+        test_conc = [m for m in perf_mentions if m["metric"] == "concurrency" and m["mode"] == "test"]
+        promise_latency = [m for m in perf_mentions if m["metric"] == "latency" and m["mode"] == "promise"]
+        test_latency = [m for m in perf_mentions if m["metric"] == "latency" and m["mode"] == "test"]
+
+        if promise_conc and not test_conc:
+            candidates.append(
+                {
+                    "type": "performance_evidence_gap",
+                    "severity": "Medium",
+                    "diagnosis": "存在并发能力承诺，但未检索到可核验的并发测试证据。",
+                    "suggestion": "在测试章节补充并发压测数据（并发量、成功率、平均/分位响应时间、错误率）。",
+                    "evidence_list": promise_conc[:4],
+                }
+            )
+        elif promise_conc and test_conc:
+            promised = max(m["value"] for m in promise_conc)
+            tested = max(m["value"] for m in test_conc)
+            if tested < promised * 0.8:
+                ev = sorted(promise_conc + test_conc, key=lambda x: float(x.get("value", 0)), reverse=True)[:6]
+                candidates.append(
+                    {
+                        "type": "performance_claim_conflict",
+                        "severity": "High",
+                        "diagnosis": f"并发承诺（{int(promised)}）与测试证据（最高 {int(tested)}）存在明显落差。",
+                        "suggestion": "统一承诺口径与测试结果；若测试覆盖不足，请补充相同场景下的压测证据。",
+                        "evidence_list": ev,
+                    }
+                )
+
+        if promise_latency and not test_latency:
+            candidates.append(
+                {
+                    "type": "performance_evidence_gap",
+                    "severity": "Medium",
+                    "diagnosis": "存在响应时间承诺，但未检索到可核验的性能测试证据。",
+                    "suggestion": "在测试章节补充响应时间测试（平均值、P95/P99、测试环境和并发条件）。",
+                    "evidence_list": promise_latency[:4],
+                }
+            )
+        elif promise_latency and test_latency:
+            promise_limit = min(m["value"] for m in promise_latency)  # 越小越严格
+            tested_worst = max(m["value"] for m in test_latency)
+            if tested_worst > promise_limit * 1.2:
+                ev = sorted(promise_latency + test_latency, key=lambda x: float(x.get("value", 0)), reverse=True)[:6]
+                candidates.append(
+                    {
+                        "type": "performance_claim_conflict",
+                        "severity": "High",
+                        "diagnosis": (
+                            f"响应时间承诺（≤{int(promise_limit)}ms）与测试证据（最差约 {int(tested_worst)}ms）不一致。"
+                        ),
+                        "suggestion": "统一性能承诺与测试结果；必要时拆分场景并分别给出指标与边界条件。",
+                        "evidence_list": ev,
+                    }
+                )
+
+        # === 规则触发 -> LLM 复核 ===
+        issues: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            verify_result = self._verify_consistency_candidate_with_llm(candidate)
+            issue = self._build_consistency_issue_from_candidate(candidate, verify_result)
+            if issue:
+                issues.append(issue)
+
+        print(f"[Consistency] Added {len(issues)} targeted consistency issues")
+        return issues
 
     def _normalize_claim_text(self, text: str) -> str:
         if not isinstance(text, str):
@@ -945,31 +1461,545 @@ class LogicAgent:
                 for i in toc_issues
             )
         outline_text = "\n".join(current_outline)
+        rule_hints = self._retrieve_rule_hints_for_toc(current_outline, toc_issues)
         user_content = f"""当前目录：
 {outline_text}
 
 已发现的目录问题：
 {issues_text}
 
+规则库命中条款（请严格遵循）：
+{rule_hints}
+
 请按 prompt 要求输出 JSON（仅含 summary 与 suggested_outline）。"""
-        messages = [
-            {"role": "system", "content": toc_final_suggestion_prompt},
-            {"role": "user", "content": user_content},
-        ]
-        try:
-            response = self.doc_agent._call_llm(
-                messages, max_tokens=2048, temperature=0.0
-            )
-            raw = response.choices[0].message.content or ""
-            data = self.doc_agent._parse_json(raw)
-            if isinstance(data, dict):
-                return {
+        messages = [{"role": "system", "content": toc_final_suggestion_prompt}]
+
+        # 受控生成：失败反馈重试，降低遗漏关键小节的概率
+        feedback = ""
+        latest_data: Dict[str, Any] = {"summary": "", "suggested_outline": []}
+        for _ in range(2):
+            try:
+                response = self.doc_agent._call_llm(
+                    messages
+                    + [
+                        {
+                            "role": "user",
+                            "content": user_content
+                            + (f"\n\n上次输出问题（请修复后重答）：\n{feedback}" if feedback else ""),
+                        }
+                    ],
+                    max_tokens=2048,
+                    temperature=0.0,
+                )
+                raw = response.choices[0].message.content or ""
+                data = self.doc_agent._parse_json(raw)
+                if not isinstance(data, dict):
+                    feedback = "输出不是合法 JSON 对象。"
+                    continue
+                latest_data = {
                     "summary": data.get("summary", ""),
                     "suggested_outline": data.get("suggested_outline") or [],
                 }
+                ok, problems = self._validate_toc_suggested_outline(
+                    latest_data.get("suggested_outline") or []
+                )
+                if ok:
+                    return latest_data
+                feedback = "；".join(problems)
+            except Exception as e:
+                print(f"[Logic] 目录总结建议生成失败: {e}")
+                feedback = f"调用失败：{e}"
+
+        # 最后兜底：程序化补齐关键目录规范
+        repaired_outline = self._repair_toc_outline(
+            latest_data.get("suggested_outline") or current_outline
+        )
+        return {
+            "summary": latest_data.get("summary", ""),
+            "suggested_outline": repaired_outline,
+        }
+
+    def _load_system_rules(self) -> Dict[str, Any]:
+        """从 rules/*.docx 提取开发类论文目录规则。"""
+        cache = getattr(self, "_system_rules_cache", None)
+        if isinstance(cache, dict):
+            return cache
+
+        rules: Dict[str, Any] = {
+            "source": "",
+            "raw_lines": [],
+            "top_required": [1, 2, 3, 4, 5, 6, 7],
+            "required_subsections": set(),
+            "optional_subsections": set(),
+            "chapter_titles": {},
+        }
+
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        rules_dir = os.path.join(base_dir, "rules")
+        docx_candidates: List[str] = []
+        if os.path.isdir(rules_dir):
+            for name in os.listdir(rules_dir):
+                if name.lower().endswith(".docx"):
+                    docx_candidates.append(os.path.join(rules_dir, name))
+        if not docx_candidates:
+            self._system_rules_cache = rules
+            return rules
+
+        preferred = [
+            p
+            for p in docx_candidates
+            if "开发类论文目录结构" in os.path.basename(p)
+        ]
+        docx_path = preferred[0] if preferred else docx_candidates[0]
+        rules["source"] = docx_path
+
+        try:
+            with zipfile.ZipFile(docx_path) as zf:
+                xml = zf.read("word/document.xml").decode("utf-8", errors="ignore")
+            text = re.sub(r"<[^>]+>", "\n", xml)
+            text = re.sub(r"\n+", "\n", text)
+            lines = [x.strip() for x in text.splitlines() if x.strip()]
+            rules["raw_lines"] = lines
+
+            chapter_titles: Dict[int, str] = {}
+            required_subsections = set()
+            optional_subsections = set()
+
+            for line in lines:
+                m_top = re.match(r"^第\s*([一二三四五六七])\s*章\s*(.+)$", line)
+                if m_top:
+                    num_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7}
+                    n = num_map.get(m_top.group(1))
+                    if n:
+                        chapter_titles[n] = m_top.group(2).strip()
+                    continue
+
+                m_sub = re.match(r"^(\d+\.\d+)\s*(.+)$", line)
+                if m_sub:
+                    num = m_sub.group(1)
+                    if "可选" in line:
+                        optional_subsections.add(num)
+                    else:
+                        required_subsections.add(num)
+
+            if chapter_titles:
+                rules["chapter_titles"] = chapter_titles
+            if required_subsections:
+                rules["required_subsections"] = required_subsections
+            if optional_subsections:
+                rules["optional_subsections"] = optional_subsections
         except Exception as e:
-            print(f"[Logic] 目录总结建议生成失败: {e}")
-        return {"summary": "", "suggested_outline": []}
+            print(f"[Logic] 规则文档解析失败，回退默认规则: {e}")
+
+        self._system_rules_cache = rules
+        return rules
+
+    def _retrieve_rule_hints_for_toc(
+        self, current_outline: List[str], toc_issues: List[Dict[str, Any]]
+    ) -> str:
+        """RAG-lite：从规则文档中按关键词召回与当前目录最相关的条款。"""
+        if self.thesis_type != "system":
+            return "（非程序开发类论文，不启用开发类目录规则库）"
+
+        rules = self._load_system_rules()
+        lines = rules.get("raw_lines") or []
+        if not lines:
+            return "（未找到规则文档，使用内置目录规范）"
+
+        query_text = "\n".join(current_outline) + "\n" + "\n".join(
+            str(i.get("suggestion", "")) for i in toc_issues
+        )
+        tokens = [t for t in ["绪论", "需求", "设计", "实现", "测试", "总结", "展望", "1.1", "1.2", "1.3", "1.4", "6.3", "数据库"] if t in query_text]
+        if not tokens:
+            tokens = ["绪论", "需求", "设计", "实现", "测试"]
+
+        scored = []
+        for line in lines:
+            score = sum(1 for t in tokens if t in line)
+            if score > 0:
+                scored.append((score, line))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [x[1] for x in scored[:12]]
+        if not top:
+            top = lines[:8]
+        return "\n".join(f"- {x}" for x in top)
+
+    def _validate_toc_suggested_outline(self, outline: List[str]) -> tuple[bool, List[str]]:
+        """校验推荐目录是否满足最基本结构约束。"""
+        if not outline:
+            return False, ["suggested_outline 为空"]
+
+        lines = [str(x).strip() for x in outline if str(x).strip()]
+        top_nums = set()
+        sub_nums = set()
+        has_reference = any("参考文献" in x for x in lines)
+        has_ack = any("致谢" in x for x in lines)
+
+        for line in lines:
+            m = re.match(r"^(\d+(?:\.\d+)*)\s+", line)
+            if not m:
+                continue
+            num = m.group(1)
+            if "." in num:
+                sub_nums.add(num)
+            else:
+                top_nums.add(int(num))
+
+        problems: List[str] = []
+        # 程序开发类：1~7章与关键小节是强约束
+        if self.thesis_type == "system":
+            rules = self._load_system_rules()
+            top_required = rules.get("top_required") or [1, 2, 3, 4, 5, 6, 7]
+            required_subsections = set(rules.get("required_subsections") or [])
+            optional_subsections = set(rules.get("optional_subsections") or [])
+
+            for n in top_required:
+                if n not in top_nums:
+                    problems.append(f"缺少第{n}章")
+
+            # 关键章节不应仅有大标题
+            for n in [2, 3, 4, 5, 6, 7]:
+                if n in top_nums and not any(s.startswith(f"{n}.") for s in sub_nums):
+                    problems.append(f"第{n}章缺少二级小节")
+
+            # 开发类目录模板硬约束（来源：rules/*.docx）
+            for num in sorted(required_subsections):
+                if num not in sub_nums:
+                    problems.append(f"缺少必备小节 {num}")
+
+            for num in sorted(optional_subsections):
+                if num not in sub_nums:
+                    problems.append(f"建议补充小节 {num}")
+
+        if not has_reference:
+            problems.append("缺少参考文献")
+        if not has_ack:
+            problems.append("缺少致谢")
+
+        # “建议补充”不作为硬失败
+        hard_problems = [p for p in problems if not p.startswith("建议补充")]
+        return len(hard_problems) == 0, problems
+
+    def _repair_toc_outline(self, outline: List[str]) -> List[str]:
+        """程序化兜底：补齐关键章节，尽量少改原输出。"""
+        lines = [str(x).strip() for x in outline if str(x).strip()]
+        if not lines:
+            lines = []
+
+        def _has_prefix(prefix: str) -> bool:
+            return any(x.startswith(prefix + " ") or x.startswith(prefix + ".") for x in lines)
+
+        def _ensure_line(target: str):
+            if target not in lines:
+                lines.append(target)
+
+        if self.thesis_type == "system":
+            rules = self._load_system_rules()
+            # 程序开发类兜底：确保 1~7 一级章存在
+            top_titles = rules.get("chapter_titles") or {}
+            top_defaults = {
+                1: f"1 {top_titles.get(1, '绪论')}",
+                2: f"2 {top_titles.get(2, '关键技术与工具')}",
+                3: f"3 {top_titles.get(3, '系统需求分析')}",
+                4: f"4 {top_titles.get(4, '系统设计')}",
+                5: f"5 {top_titles.get(5, '系统实现')}",
+                6: f"6 {top_titles.get(6, '系统测试')}",
+                7: f"7 {top_titles.get(7, '总结与展望')}",
+            }
+            for n in (rules.get("top_required") or [1, 2, 3, 4, 5, 6, 7]):
+                if not _has_prefix(str(n)):
+                    _ensure_line(top_defaults[n])
+
+            # 按规则补齐必备/可选小节。标题优先沿用规则原文，否则用通用占位。
+            subsection_title_defaults = {
+                "1.1": "选题背景及意义",
+                "1.2": "国内外研究现状",
+                "1.3": "主要研究内容",
+                "1.4": "论文组织结构",
+                "2.1": "关键技术与工具概述",
+                "3.1": "可行性分析",
+                "3.2": "功能需求分析",
+                "3.3": "非功能需求分析",
+                "3.4": "业务流程与数据流程分析",
+                "4.1": "系统架构设计",
+                "4.2": "功能模块设计",
+                "4.3": "系统核心业务流程设计",
+                "4.4": "数据库设计",
+                "4.5": "接口设计",
+                "5.1": "开发环境",
+                "5.2": "系统功能实现",
+                "6.1": "测试目的与环境",
+                "6.2": "系统功能测试",
+                "6.3": "系统性能测试",
+                "6.4": "测试结果",
+                "7.1": "总结",
+                "7.2": "展望",
+            }
+            all_subs = sorted(
+                set(rules.get("required_subsections") or [])
+                | set(rules.get("optional_subsections") or [])
+            )
+            for num in all_subs:
+                if not _has_prefix(num):
+                    title = subsection_title_defaults.get(num, "小节")
+                    _ensure_line(f"{num} {title}")
+
+        _ensure_line("参考文献")
+        _ensure_line("致谢")
+
+        # 按层级与编号排序，非编号项放在末尾保持稳定
+        def _sort_key(line: str):
+            m = re.match(r"^(\d+(?:\.\d+)*)\s+", line)
+            if not m:
+                tail_order = 0
+                if "参考文献" in line:
+                    tail_order = 1
+                elif "致谢" in line:
+                    tail_order = 2
+                elif "附录" in line:
+                    tail_order = 3
+                return (999, tail_order, line)
+            nums = [int(x) for x in m.group(1).split(".")]
+            return (0, nums, line)
+
+        # 先去重
+        dedup = []
+        seen = set()
+        for x in lines:
+            if x not in seen:
+                seen.add(x)
+                dedup.append(x)
+        lines = dedup
+
+        numbered = [x for x in lines if re.match(r"^\d+(?:\.\d+)*\s+", x)]
+        tails = [x for x in lines if x not in numbered]
+        numbered.sort(key=_sort_key)
+        tails.sort(key=_sort_key)
+        return numbered + tails
+
+    def _cn_num_to_int(self, s: str) -> int | None:
+        if not s:
+            return None
+        s = s.strip()
+        if s.isdigit():
+            return int(s)
+        mapping = {
+            "一": 1,
+            "二": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+            "十": 10,
+        }
+        if s in mapping:
+            return mapping[s]
+        if s.startswith("十") and len(s) == 2 and s[1] in mapping:
+            return 10 + mapping[s[1]]
+        if s.endswith("十") and len(s) == 2 and s[0] in mapping:
+            return mapping[s[0]] * 10
+        return None
+
+    def normalize_toc_entries(self, section_xml: str) -> List[Dict[str, Any]]:
+        """清洗目录 XML 并拆分为结构化条目。"""
+        entries: List[Dict[str, Any]] = []
+        if not section_xml:
+            return entries
+        try:
+            root = ET.fromstring(section_xml)
+        except Exception:
+            return entries
+
+        raw_lines: List[str] = []
+        for node in root.iter():
+            if node.tag in {"Heading", "Title", "Paragraph"} and node.text:
+                txt = node.text.strip()
+                if txt:
+                    raw_lines.extend([x.strip() for x in txt.splitlines() if x.strip()])
+
+        for line in raw_lines:
+            if "杭州电子科技大学继续教育学院" in line:
+                continue
+            if re.fullmatch(r"\d+", line):
+                continue
+            cleaned = re.sub(r"[.\u00b7•…]{2,}", " ", line)
+            cleaned = cleaned.replace("：", " ").replace(":", " ")
+            cleaned = re.sub(r"\s+\d+\s*$", "", cleaned)
+            cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+            if not cleaned:
+                continue
+
+            m_sub = re.match(r"^\s*(\d+(?:\.\d+)+)\s+(.+)$", cleaned)
+            if m_sub:
+                entries.append(
+                    {
+                        "raw": line,
+                        "normalized": cleaned,
+                        "level": m_sub.group(1).count(".") + 1,
+                        "chapter_num": int(m_sub.group(1).split(".")[0]),
+                        "number_text": m_sub.group(1),
+                        "title": m_sub.group(2).strip(),
+                    }
+                )
+                continue
+
+            m_top = re.match(
+                r"^\s*(?:第\s*)?([0-9一二三四五六七八九十]{1,2})\s*(?:章)?(?:[、.\s]+)(.+)$",
+                cleaned,
+            )
+            if m_top:
+                chapter_num = self._cn_num_to_int(m_top.group(1))
+                if chapter_num is not None:
+                    entries.append(
+                        {
+                            "raw": line,
+                            "normalized": cleaned,
+                            "level": 1,
+                            "chapter_num": chapter_num,
+                            "number_text": str(chapter_num),
+                            "title": m_top.group(2).strip(),
+                        }
+                    )
+
+        return entries
+
+    def _extract_clean_toc_lines(self, section_xml: str) -> List[str]:
+        """目录清洗：去页眉页脚/纯页码/点线噪声，输出给 LLM 的目录文本行。"""
+        cleaned_lines: List[str] = []
+        if not section_xml:
+            return cleaned_lines
+        try:
+            root = ET.fromstring(section_xml)
+        except Exception:
+            return cleaned_lines
+
+        for node in root.iter():
+            if node.tag not in {"Heading", "Title", "Paragraph"}:
+                continue
+            if not node.text:
+                continue
+            text = node.text.strip()
+            if not text:
+                continue
+            for raw_line in [x.strip() for x in text.splitlines() if x.strip()]:
+                if not raw_line:
+                    continue
+                # 目录专用页眉页脚过滤（避免误用全局规则误删正文目录项）
+                if re.search(
+                    r"(杭州电子科技大学继续教育学院|本科毕业论文|第\s*\d+\s*页|^\s*-\s*\d+\s*-\s*$)",
+                    raw_line,
+                ):
+                    continue
+                if re.fullmatch(r"\d+", raw_line):
+                    continue
+                # 清理目录引导点、尾部页码、奇异符号，保留主体文字
+                line = re.sub(r"[.\u00b7•…]{2,}", " ", raw_line)
+                line = line.replace("：", " ").replace(":", " ")
+                line = re.sub(r"\s+\d+\s*$", "", line)
+                line = re.sub(r"\s{2,}", " ", line).strip()
+                if not line:
+                    continue
+                cleaned_lines.append(line)
+
+        return cleaned_lines
+
+    def toc_rule_check(self, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """基于结构化目录条目做规则校验，输出 exists/missing。"""
+        required = [1, 2, 3, 4, 5, 6, 7]
+        top_level_present = sorted(
+            {
+                int(e["chapter_num"])
+                for e in entries
+                if e.get("level") == 1 and e.get("chapter_num") is not None
+            }
+        )
+        exists = {str(n): (n in top_level_present) for n in required}
+        missing = [str(n) for n in required if n not in top_level_present]
+        return {
+            "exists": exists,
+            "missing": missing,
+            "present": [str(n) for n in top_level_present],
+        }
+
+    def _extract_missing_chapter_num_from_issue(self, issue: Dict[str, Any]) -> int | None:
+        text = " ".join(
+            [
+                str(issue.get("quote", "")),
+                str(issue.get("suggestion", "")),
+                str(issue.get("section", "")),
+            ]
+        )
+        m = re.search(
+            r"(?:缺少|缺失|未见|没有)\s*第?\s*([0-9一二三四五六七八九十]{1,2})\s*章?",
+            text,
+        )
+        if not m:
+            return None
+        return self._cn_num_to_int(m.group(1))
+
+    def _merge_toc_rule_result(self, map_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        exists_agg: Dict[str, bool] = {}
+        present = set()
+        for res in map_results:
+            rule = res.get("toc_rule_result")
+            if not isinstance(rule, dict):
+                continue
+            exists = rule.get("exists") or {}
+            if isinstance(exists, dict):
+                for k, v in exists.items():
+                    exists_agg[str(k)] = bool(exists_agg.get(str(k), False) or bool(v))
+            for p in rule.get("present") or []:
+                present.add(str(p))
+        missing = [k for k, v in exists_agg.items() if not v]
+        return {"exists": exists_agg, "present": sorted(present), "missing": sorted(missing)}
+
+    def _apply_toc_conflict_downgrade(
+        self, toc_issues: List[Dict[str, Any]], toc_rule_result: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """exists 与缺章判断冲突时，执行冲突降级（High/Medium -> Low）。"""
+        exists = toc_rule_result.get("exists") or {}
+        if not isinstance(exists, dict):
+            return toc_issues
+
+        downgraded = 0
+        output: List[Dict[str, Any]] = []
+        for issue in toc_issues:
+            chapter_num = self._extract_missing_chapter_num_from_issue(issue)
+            if chapter_num is None:
+                output.append(issue)
+                continue
+            if exists.get(str(chapter_num), False):
+                new_issue = dict(issue)
+                new_issue["severity"] = "Low"
+                new_issue["issue_type"] = "目录结构"
+                original_quote = str(new_issue.get("quote", "")).strip()
+                original_evidence_quote = str(new_issue.get("evidence_quote", "")).strip()
+                base_quote = str(new_issue.get("quote", "")).strip()
+                new_issue["quote"] = (
+                    f"[规则复核] 目录条目中检测到第{chapter_num}章。"
+                    + (f" 原始描述：{base_quote}" if base_quote else "")
+                )
+                # 保留可追溯证据：目录规则复核属于结构证据，不把规则说明当作原文证据。
+                new_issue["evidence_quote"] = original_evidence_quote or original_quote
+                new_issue["evidence_status"] = (
+                    "verifiable" if new_issue["evidence_quote"] else "synthetic"
+                )
+                new_issue["evidence_mode"] = "structural_rule"
+                new_issue["suggestion"] = (
+                    f"规则校验显示第{chapter_num}章已存在，当前缺章结论可能受 OCR/目录排版噪声影响。"
+                    "建议人工复核目录页后再决定是否修改目录结构。"
+                )
+                output.append(new_issue)
+                downgraded += 1
+            else:
+                output.append(issue)
+        if downgraded:
+            print(f"[Logic] 目录冲突降级：{downgraded} 条")
+        return output
+
 
     def run_hierarchical_logic_review(self) -> Dict[str, Any]:
         """
@@ -1098,6 +2128,8 @@ class LogicAgent:
                 "注意直接使用 XML 节点中的 page_num，如果节点没有 page_num 再用章节 start_page_num 兜底，不要猜测页码。"
             )
 
+            toc_rule_result = None
+            is_toc_chapter = False
             try:
 
                 def _run_local_review(system_prompt):
@@ -1135,6 +2167,49 @@ class LogicAgent:
                         selected_prompt = table_of_contents_check_prompt
                         print(f"[Logic] 使用通用目录结构审查prompt")
                     is_toc_chapter = True
+
+                    toc_xml_for_review = chap["content_xml"]
+                    try:
+                        if chap.get("section_id"):
+                            # 目录章节使用原始 section（保留完整目录文本），避免通用过滤误删目录行
+                            toc_root = self.doc_agent.doc_reader.get_section_content(
+                                chap["section_id"]
+                            )
+                            toc_xml_for_review = ET.tostring(
+                                toc_root, encoding="unicode", method="xml"
+                            )
+                    except Exception as e:
+                        print(f"[Logic] 读取目录原始section失败，回退已过滤内容: {e}")
+
+                    normalized_entries = self.normalize_toc_entries(toc_xml_for_review)
+                    toc_clean_lines = self._extract_clean_toc_lines(toc_xml_for_review)
+                    toc_clean_text = "\n".join(toc_clean_lines)
+                    toc_rule_result = self.toc_rule_check(normalized_entries)
+                    structured_lines = [
+                        f"{e.get('number_text', '')} {e.get('title', '')}".strip()
+                        for e in normalized_entries
+                    ]
+
+                    user_content = (
+                        f"章节标题：{chap['title']}\n"
+                        "目录清洗文本（已过滤页眉页脚与页码噪声）：\n"
+                        + (toc_clean_text if toc_clean_text else "（无可用目录文本）")
+                        + "\n\n"
+                        f"章节XML内容（原始复核用）：\n{toc_xml_for_review}\n\n"
+                        "目录结构化条目（normalize_toc_entries）：\n"
+                        + (
+                            "\n".join(structured_lines)
+                            if structured_lines
+                            else "（无可解析条目）"
+                        )
+                        + "\n\n"
+                        "规则校验结果（toc_rule_check, exists/missing）：\n"
+                        + json.dumps(toc_rule_result, ensure_ascii=False)
+                        + "\n\n"
+                        "请先基于目录清洗文本判断目录结构，再用原始 XML 与结构化条目交叉复核。"
+                        "若判定“缺少某章”，必须引用清洗文本中的直接证据；若证据不足请不要下缺章结论。"
+                    )
+
                 # 如果是程序开发类论文，针对特定章节使用专用prompt
                 elif self.thesis_type == "system":
                     if "摘要" in chap["title"] or "abstract" in chapter_title_lower:
@@ -1252,6 +2327,8 @@ class LogicAgent:
                         "issues": data.get("issues", []),
                         "start_page_num": chap.get("start_page_num"),
                         "section_id": chap.get("section_id"),
+                        "toc_rule_result": toc_rule_result if is_toc_chapter else None,
+                        "toc_entries": normalized_entries if is_toc_chapter else [],
                     }
                 )
 
@@ -1281,6 +2358,8 @@ class LogicAgent:
                         "issues": [],
                         "start_page_num": chap.get("start_page_num"),
                         "section_id": chap.get("section_id"),
+                        "toc_rule_result": toc_rule_result if is_toc_chapter else None,
+                        "toc_entries": normalized_entries if is_toc_chapter else [],
                     }
                 )
 
@@ -1370,12 +2449,48 @@ class LogicAgent:
                         toc_issues.append(issue)
                     else:
                         other_map_issues.append(issue)
+            merged_toc_rule = self._merge_toc_rule_result(map_results)
+            toc_issues = self._apply_toc_conflict_downgrade(toc_issues, merged_toc_rule)
             # 目录问题放在逻辑问题开头
             all_issues = toc_issues + other_map_issues
-            all_issues.extend(global_issues)
+            # 全局阶段的目录问题也执行同样的冲突降级，避免“规则已检出存在”却仍报缺章
+            global_toc_issues = []
+            global_other_issues = []
+            for issue in global_issues:
+                if issue.get("issue_type") == "目录结构":
+                    global_toc_issues.append(issue)
+                else:
+                    global_other_issues.append(issue)
+            global_toc_issues = self._apply_toc_conflict_downgrade(
+                global_toc_issues, merged_toc_rule
+            )
+            all_issues.extend(global_toc_issues + global_other_issues)
 
-            # 目录检测总结：总建议 + 修改后的推荐目录
-            current_outline = [res["title"] for res in map_results]
+            # 目录检测总结：优先使用目录章节的完整层级条目（如 1/1.1/1.1.1），兜底再用顶层标题
+            current_outline: List[str] = []
+            for res in map_results:
+                for e in res.get("toc_entries") or []:
+                    number_text = str(e.get("number_text", "")).strip()
+                    title_text = str(e.get("title", "")).strip()
+                    if number_text and title_text:
+                        current_outline.append(f"{number_text} {title_text}")
+                    elif title_text:
+                        current_outline.append(title_text)
+
+            # 去重并保持顺序
+            if current_outline:
+                seen = set()
+                dedup_outline = []
+                for line in current_outline:
+                    key = line.strip()
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    dedup_outline.append(key)
+                current_outline = dedup_outline
+            else:
+                current_outline = [res["title"] for res in map_results]
+
             toc_suggestion = self._get_toc_final_suggestion(current_outline, toc_issues)
             if toc_suggestion.get("summary") or toc_suggestion.get("suggested_outline"):
                 print("\n[目录检测] ========== AI 总建议 ==========")
@@ -1392,6 +2507,17 @@ class LogicAgent:
             all_issues.extend(fact_conflicts)
             print(
                 f"[Fact Conflict Detection] Added {len(fact_conflicts)} conflict issues\n"
+            )
+
+            print(
+                "\n[Consistency] Starting targeted cross-chapter consistency checks..."
+            )
+            targeted_consistency_issues = self._detect_targeted_consistency_conflicts(
+                chapters
+            )
+            all_issues.extend(targeted_consistency_issues)
+            print(
+                f"[Consistency] Added {len(targeted_consistency_issues)} consistency issues\n"
             )
 
             for issue in all_issues:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 
 from .prompts import normative_prompt, vision_verify_prompt
@@ -389,6 +390,66 @@ class NormativeAgent:
             print(f"[NormativeAgent] Caption position issues: {len(issues)}")
         return issues
 
+    def _check_citation_superscript_position(self, max_issues: int = 20) -> list:
+        """
+        规则检查：正文引用标识应使用右上角上标形式。
+        对纯文本 XML 而言，若检测到普通行内 [n] 引用（如“扩展[17]。”）则提示为可能未上标。
+        """
+        issues = []
+        root = self.doc_agent.doc_reader.root
+        citation_pattern = re.compile(r"\[(\d+(?:\s*[-,，]\s*\d+)*)\]")
+
+        # 与其他 Agent 对齐：从摘要章节开始扫描
+        abstract_idx = self.doc_agent._get_abstract_start_section_index()
+        top_sections = [c for c in list(root) if c.tag == "Section"]
+        if abstract_idx is not None:
+            top_sections = top_sections[abstract_idx:]
+
+        def _get_section_title(section):
+            for child in list(section):
+                if child.tag in ["Heading", "Title"] and (child.text or "").strip():
+                    return (child.text or "").strip()
+            return section.get("section_id", "未知章节")
+
+        for section in top_sections:
+            section_title = _get_section_title(section)
+            for node in section.iter():
+                if node.tag not in {"Paragraph", "Heading", "Title"}:
+                    continue
+                text = (node.text or "").strip()
+                if not text:
+                    continue
+                # 过滤页眉页脚类文本，降低误报
+                page_num = node.get("page_num")
+                if self.doc_agent._is_header_footer(text, page_num):
+                    continue
+
+                for match in citation_pattern.finditer(text):
+                    quote = text
+                    marker = match.group(0)
+                    issues.append(
+                        {
+                            "issue_type": "规范性",
+                            "severity": "Medium",
+                            "section": section_title,
+                            "page": page_num or section.get("start_page_num", "N/A"),
+                            "quote": quote,
+                            "suggestion": (
+                                f"检测到引用标识 {marker} 为普通行内形式。"
+                                "按论文格式规范，引用标识建议置于右上角上标形式（如“...扩展[17]”中的[17]应以上标显示）。"
+                            ),
+                        }
+                    )
+                    if len(issues) >= max_issues:
+                        print(
+                            f"[NormativeAgent] Citation superscript issues capped at {max_issues}"
+                        )
+                        return issues
+
+        if issues:
+            print(f"[NormativeAgent] Citation superscript issues: {len(issues)}")
+        return issues
+
     def run_normative_review(self) -> Dict[str, Any]:
         """
         规范性审查（滑动窗口版本）。审查起点与 LogicAgent、VisionAgent 对齐：均从「摘要」开始。
@@ -492,6 +553,11 @@ class NormativeAgent:
         rule_issues = self._check_media_caption_positions()
         if rule_issues:
             all_issues.extend(rule_issues)
+
+        # 追加规则检测：引用标识应使用右上角上标
+        citation_issues = self._check_citation_superscript_position()
+        if citation_issues:
+            all_issues.extend(citation_issues)
 
         # 去重（在步骤 3 实现）
         deduplicated_issues = self._deduplicate_issues(all_issues)

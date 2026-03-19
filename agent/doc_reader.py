@@ -236,14 +236,16 @@ class OutlineOnlyReader:
             if index is not None and index < len(image_files):
                 self.image_path_dict[img_id] = image_files[index]
 
-        for elem in self.root.iter("CSV_Table"):
-            table_id = elem.get("table_id")
-            if table_id is None:
-                continue
-            img_path = elem.get("image_path")
-            if img_path:
-                self.table_image_path_dict[str(table_id)] = img_path
-                continue
+        # 同时兼容 CSV_Table 与 Table，两者都可能携带 table_id/image_path
+        for tag in ("CSV_Table", "Table"):
+            for elem in self.root.iter(tag):
+                table_id = elem.get("table_id")
+                if table_id is None:
+                    continue
+                img_path = elem.get("image_path")
+                if img_path:
+                    self.table_image_path_dict[str(table_id)] = img_path
+                    continue
 
         self.image_count = len(self.image_path_dict)
         self.table_count = len(self.table_image_path_dict)
